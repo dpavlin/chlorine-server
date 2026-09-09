@@ -39,6 +39,7 @@ int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
                              double* prefill_ms, double* decode_ms, int* stop_hit,
                              const chlorine_sample_opts* opts);
 void chlorine_trunk_shutdown(void);
+int chlorine_trunk_context_capacity(void);
 }
 
 bool g_trunk_ready = false;
@@ -92,8 +93,8 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
                                        eos.data(), int(eos.size()), trunk_emit, &ec,
                                        &prefill_ms, &decode_ms, &stop_hit, &so);
   if (n_gen < 0) {
-    fprintf(stderr, "serve: request %ld prompt/max_tokens out of trunk capacity (%d)\n",
-            id, n_gen);
+    fprintf(stderr, "serve: request %ld prompt/max_tokens out of trunk capacity (%d, prompt_len=%zu, max_tokens=%d, cap=%d)\n",
+            id, n_gen, prompt.size(), max_tokens, chlorine_trunk_context_capacity());
     char buf[64];
     snprintf(buf, sizeof buf, "D %ld error 0 0 0.0 0.0\n", id);
     send(fd, buf, strlen(buf), MSG_NOSIGNAL);
@@ -184,15 +185,16 @@ int main(int argc, char** argv) {
   Checkpoint ckpt(ckpt_path);
   if (do_info) build_info(ckpt);
   if (do_serve) {
-    Server::Options o;
-    o.port = port;
-    o.bind = bind;
-    o.default_drafter = ckpt.has_dflash2() ? 2 : (ckpt.has_mtp() ? 1 : 0);
     // CHLORINE_STUB=1 forces the deterministic stub generator (wire-protocol
     // conformance runs; the real trunk takes minutes per GEN while weights
     // stream from the checkpoint).
     if (!getenv("CHLORINE_STUB") && !g_trunk_ready && !ckpt_path.empty())
       g_trunk_ready = chlorine_trunk_init(ckpt_path.c_str()) == 0;
+    Server::Options o;
+    o.port = port;
+    o.bind = bind;
+    o.slot_ctx = g_trunk_ready ? chlorine_trunk_context_capacity() : 2048;
+    o.default_drafter = ckpt.has_dflash2() ? 2 : (ckpt.has_mtp() ? 1 : 0);
     Server svr(ckpt, o, g_trunk_ready && !getenv("CHLORINE_STUB") ? real_generate
                                                                   : stub_generate,
                nullptr);
