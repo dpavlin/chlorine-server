@@ -708,8 +708,8 @@ static int g_actq = 0;    // engine-default serve prefill is CLEAN; HALO_ACTQ=3 
 static int g_dnprep = 1;  // 1: round l2normed q/k to bf16 (engine inter-kernel dtype)
 static int g_beta32 = 0;  // 0: beta stays f32 (k_dn_gates emits f32) — matches engine clean path
 static void dbg_all(const char* tag, const uint16_t* d_buf, long rows, long width) {
-  static uint16_t tmp[TMAX * 17408];
-  CK(hipMemcpy(tmp, d_buf, rows * width * 2, hipMemcpyDeviceToHost));
+  std::vector<uint16_t> tmp((size_t)rows * width);
+  CK(hipMemcpy(tmp.data(), d_buf, rows * width * 2, hipMemcpyDeviceToHost));
   double mx = 0, sm = 0; long nan = 0;
   for (long i = 0; i < rows * width; i++) {
     float v = h_bf16f(tmp[i]);
