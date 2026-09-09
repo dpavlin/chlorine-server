@@ -1252,8 +1252,8 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
                                        void (*emit)(void*, int), void* ctx,
                                        double* prefill_ms, double* decode_ms, int* stop_hit) {
   if (!g_ready) return -1;
-  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1 ||
-      max_tokens > (long)(CXT - n_prompt)) return -2;
+  if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1) return -2;
+  if (max_tokens > (long)(CXT - n_prompt)) max_tokens = (long)(CXT - n_prompt);
   trunk_reset_states();
   double tp = now_s();
   up(d_tok, prompt, (size_t)n_prompt * 4);
@@ -1434,8 +1434,8 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
                                         double* prefill_ms, double* decode_ms, int* stop_hit,
                                         const chlorine_sample_opts* opts) {
   if (!g_ready) return -1;
-  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1 ||
-      max_tokens > (long)(CXT - n_prompt)) return -2;
+  if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1) return -2;
+  if (max_tokens > (long)(CXT - n_prompt)) max_tokens = (long)(CXT - n_prompt);
   bool sample = opts && opts->has_sample;
   static std::vector<int> counts;
   counts.assign(VOC, 0);
@@ -1482,4 +1482,12 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
 
 extern "C" void chlorine_trunk_shutdown(void) {
   // weights and buffers live for the process lifetime; nothing to do
+}
+
+extern "C" int chlorine_trunk_context_capacity(void) {
+  return CXT;
+}
+
+extern "C" int chlorine_trunk_tmax(void) {
+  return TMAX;
 }
