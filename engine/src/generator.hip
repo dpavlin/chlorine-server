@@ -1,3 +1,4 @@
+#include "gemm_i4.h"
 // trunk.hip — chlorine-server numeric core validation (spec: docs/halogen/*.md)
 // Qwen3.8-27B hybrid trunk (48 GDN + 16 FA layers) on gfx1151.
 // Math source: HF transformers Qwen3.5 modeling (Apache-2.0) — GatedDeltaNet,
@@ -478,6 +479,10 @@ static void load_table() {
     g_tbl[i].dt = (int)(f1 & 0xFFFFFFFF);
   }
 }
+static const Ent* find_opt(const char* name) {
+  for (auto& e : g_tbl) if (strcmp(e.name, name) == 0) return &e;
+  return nullptr;
+}
 static const Ent* find(const char* name) {
   for (auto& e : g_tbl) if (strcmp(e.name, name) == 0) return &e;
   printf("tensor not found: %s\n", name); exit(1);
@@ -578,6 +583,32 @@ static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
   }
   load_auto(name, rows, cols, d_out);
 }
+
+static uint8_t*  d_Aq_ws = nullptr;
+static uint16_t* d_As_ws = nullptr;
+
+static bool has_i4l_weight(const char* name) {
+  char i4nm[160];
+  snprintf(i4nm, sizeof(i4nm), "%s.i4l", name);
+  auto it = g_wmap.find(i4nm);
+  return (it != g_wmap.end() && it->second.dt == 8);
+}
+
+static void gemm_dispatch(const uint16_t* A, const char* name, const uint16_t* fallback_W,
+                          uint16_t* C, int M, int N, int K) {
+  char nm_i4l[160];
+  snprintf(nm_i4l, sizeof(nm_i4l), "%s.i4l", name);
+  auto it = g_wmap.find(nm_i4l);
+  if (it != g_wmap.end() && it->second.dt == 8 && d_Aq_ws && d_As_ws && (size_t)M <= 4096) {
+    const WEnt& w = it->second;
+    const uint8_t* W_q = d_wpool + w.off;
+    const uint16_t* W_s = reinterpret_cast<const uint16_t*>(d_wpool + w.off + (long)N * (K / 2));
+    chlorine::gemm_i4_fused(A, W_q, W_s, C, M, N, K, d_Aq_ws, d_As_ws);
+    return;
+  }
+  gemm(A, fallback_W, C, M, N, K);
+}
+
 
 // fused dequant GEMV (decode steps, M == 1): C[n] = sum_k A[k] * dequant(W[n][k]).
 // fp8r: per-thread 16-k strips, two f32 accumulators, xor-butterfly reduce, row
@@ -749,8 +780,71 @@ static void dbg_f32(const char* tag, const float* d_buf, long row, long width) {
 // GDN: fla-style CHUNKED gated delta rule (f32, host), chunk 64.
 // Spec: torch_chunk_gated_delta_rule in qwen35_ref.py (the engine runs k_dnc_ut/scan
 // kernels — the chunked algorithm; the sequential form is numerically different).
+
+static void gdn_step_1(const uint16_t* qkvbf, const float* af, const float* bfv,
+                       int ord, uint16_t* out) {
+  const float* al = h_alog + (long)ord * HV;
+  const float* dt = h_dtbias + (long)ord * HV;
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(static)
+#endif
+  for (int hh = 0; hh < HV; hh++) {
+    float* S = h_S + ((long)ord * HV + hh) * DK * DV;
+    const uint16_t* qp = qkvbf + (hh / 3) * DK;
+    const uint16_t* kp = qkvbf + HK * DK + (hh / 3) * DK;
+    const uint16_t* vp = qkvbf + HK * DK * 2 + hh * DV;
+
+    float qs = 0.f, ks = 0.f;
+    float Q[DK], K[DK], V[DV];
+    for (int i = 0; i < DK; i++) {
+      float a = h_bf16f(qp[i]); Q[i] = a; qs += a * a;
+      float b = h_bf16f(kp[i]); K[i] = b; ks += b * b;
+    }
+    float qi = 1.0f / sqrtf(qs + EPS) * h_qscale;
+    float ki = 1.0f / sqrtf(ks + EPS);
+    for (int i = 0; i < DK; i++) {
+      float qv = Q[i] * qi, kv_ = K[i] * ki;
+      if (g_dnprep) { qv = h_bf16f(h_f32bf(qv)); kv_ = h_bf16f(h_f32bf(kv_)); }
+      Q[i] = qv; K[i] = kv_;
+    }
+    for (int i = 0; i < DV; i++) V[i] = h_bf16f(vp[i]);
+
+    float g = -expf(al[hh]) * softplusf(af[hh] + dt[hh]);
+    float decay = expf(g);
+    float beta = 1.0f / (1.0f + expf(-bfv[hh]));
+    if (!g_beta32) beta = h_bf16f(h_f32bf(beta));
+
+    // 1. Decay state S' = decay * S
+    for (int i = 0; i < DK * DV; i++) S[i] *= decay;
+
+    // 2. Predict v_pred = K^T S'
+    // and compute vn = beta * (V - v_pred)
+    float vn[DV];
+    for (int j = 0; j < DV; j++) {
+      float k_pred = 0.f;
+      for (int i = 0; i < DK; i++) k_pred += K[i] * S[i * DV + j];
+      vn[j] = beta * (V[j] - k_pred);
+    }
+
+    // 3. Update state S = S' + K * vn^T
+    for (int i = 0; i < DK; i++) {
+      float ki = K[i];
+      for (int j = 0; j < DV; j++) {
+        S[i * DV + j] += ki * vn[j];
+      }
+    }
+
+    // 4. Output out = Q^T S
+    for (int j = 0; j < DV; j++) {
+      float out_j = 0.f;
+      for (int i = 0; i < DK; i++) out_j += Q[i] * S[i * DV + j];
+      out[hh * DV + j] = h_f32bf(out_j);
+    }
+  }
+}
 static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float* bfv,
                      int ord, uint16_t* out) {
+  if (T == 1) { gdn_step_1(qkvbf, af, bfv, ord, out); return; }
   const float* al = h_alog + (long)ord * HV;
   const float* dt = h_dtbias + (long)ord * HV;
   const int CS = 64;
@@ -916,8 +1010,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); gemv_dq(d_ln1, nm, d_qkvraw);
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   gemv_dq(d_ln1, nm, d_zout);
       } else {
-        gemm(d_ln1, d_qkv, d_qkvraw, T, QKVW, HID);
-        gemm(d_ln1, d_z, d_zout, T, HV * DV, HID);
+        gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm), d_qkv, d_qkvraw, T, QKVW, HID);
+        gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm), d_z, d_zout, T, HV * DV, HID);
       }
       if (T > 1) {
         k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
@@ -961,7 +1055,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); gemv_dq(d_gn, nm, d_tmp1);
       } else {
-        gemm(d_gn, d_outp, d_tmp1, T, HID, HV * DV);
+        gemm_dispatch(d_gn, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm), d_outp, d_tmp1, T, HID, HV * DV);
       }
       if (g_dbg) { dbg_all("zout", d_zout, T, HV * DV); dbg_all("gn", d_gn, T, HV * DV); dbg_all("gdn_attnout", d_tmp1, T, HID); }
       if (getenv("HALO_TIME")) printf("  L%d gdn load %.2fs scan %.3fs\n", l, tload, tscan);
@@ -972,9 +1066,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  gemv_dq(d_ln1, nm, d_kk);
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  gemv_dq(d_ln1, nm, d_vv);
       } else {
-        gemm(d_ln1, d_q, d_qg, T, QH * HD * 2, HID);
-        gemm(d_ln1, d_k, d_kk, T, KVH * HD, HID);
-        gemm(d_ln1, d_v, d_vv, T, KVH * HD, HID);
+        gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l), nm), d_q, d_qg, T, QH * HD * 2, HID);
+        gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l), nm), d_k, d_kk, T, KVH * HD, HID);
+        gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l), nm), d_v, d_vv, T, KVH * HD, HID);
       }
       k_headnorm<<<GRID1((long)T * QH), 256>>>(d_qg, d_qnorm + (long)gi * HD, d_qn, T, QH, QH * HD * 2, HD * 2, HD);
       k_headnorm<<<GRID1((long)T * KVH), 256>>>(d_kk, d_knorm + (long)gi * HD, d_kn, T, KVH, KVH * HD, HD, HD);
@@ -995,7 +1089,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq(d_att, nm, d_tmp1);
       } else {
-        gemm(d_att, d_o, d_tmp1, T, HID, QH * HD);
+        gemm_dispatch(d_att, (snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l), nm), d_o, d_tmp1, T, HID, QH * HD);
       }
       if (g_dbg) dbg_all("q_rope", d_qn, T, QH * HD);
     }
@@ -1009,8 +1103,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq(d_ln2, nm, d_g17);
       snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq(d_ln2, nm, d_u17);
     } else {
-      gemm(d_ln2, d_gate, d_g17, T, INTM, HID);
-      gemm(d_ln2, d_up, d_u17, T, INTM, HID);
+      gemm_dispatch(d_ln2, (snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l), nm), d_gate, d_g17, T, INTM, HID);
+      gemm_dispatch(d_ln2, (snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l), nm), d_up, d_u17, T, INTM, HID);
     }
     if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
     k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
@@ -1018,7 +1112,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq(d_act, nm, d_tmp1);
     } else {
-      gemm(d_act, d_down, d_tmp1, T, HID, INTM);
+      gemm_dispatch(d_act, (snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm), d_down, d_tmp1, T, HID, INTM);
     }
     if (g_dbg) { dbg_all("mlp_act", d_act, T, INTM); dbg_all("mlp_out", d_tmp1, T, HID); }
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
@@ -1190,22 +1284,51 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
 
   // device weight pool: all quantized projection payloads resident; forward()
   // dequants from device memory per use (fallback: per-use file streaming)
+  // Allocate activation workspace for hardware INT4 WMMA GEMM
+  if (!d_Aq_ws) {
+    size_t max_T = 4096;
+    size_t max_K = 17408;
+    CK(hipMalloc(&d_Aq_ws, max_T * (max_K / 2)));
+    CK(hipMalloc(&d_As_ws, max_T * (max_K / 256) * 2));
+  }
+
+  // device weight pool: all quantized projection payloads resident; forward()
+  // dequants from device memory per use (fallback: per-use file streaming)
   {
+    auto check_need = [&](const char* base_nm) {
+      size_t s = find(base_nm)->size;
+      char i4nm[160];
+      snprintf(i4nm, sizeof(i4nm), "%s.i4l", base_nm);
+      const Ent* ei4 = find_opt(i4nm);
+      if (ei4) s += (size_t)ei4->size;
+      return s;
+    };
+
+    auto pool_add_both = [&](const char* base_nm, long rows, long cols) {
+      bool res = pool_add(base_nm, rows, cols);
+      char i4nm[160];
+      snprintf(i4nm, sizeof(i4nm), "%s.i4l", base_nm);
+      if (find_opt(i4nm)) {
+        res &= pool_add(i4nm, rows, cols);
+      }
+      return res;
+    };
+
     size_t need = 0;
     for (int l = 0; l < NL; l++) {
       if (l % 4 == 3) {
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l), nm))->size;
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l), nm))->size;
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l), nm))->size;
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l), nm))->size;
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l), nm));
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l), nm));
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l), nm));
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l), nm));
       } else {
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm))->size;
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm))->size;
-        need += find((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm))->size;
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm));
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm));
+        need += check_need((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm));
       }
-      need += find((snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l), nm))->size;
-      need += find((snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l), nm))->size;
-      need += find((snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm))->size;
+      need += check_need((snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l), nm));
+      need += check_need((snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l), nm));
+      need += check_need((snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm));
     }
     hipError_t pe = hipMalloc(&d_wpool, need);
     if (pe != hipSuccess) {
@@ -1218,18 +1341,18 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
       bool ok = true;
       for (int l = 0; l < NL && ok; l++) {
         if (l % 4 == 3) {
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l), nm), QH * HD * 2, HID);
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l), nm), KVH * HD, HID);
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l), nm), KVH * HD, HID);
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l), nm), HID, QH * HD);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l), nm), QH * HD * 2, HID);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l), nm), KVH * HD, HID);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l), nm), KVH * HD, HID);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l), nm), HID, QH * HD);
         } else {
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm), QKVW, HID);
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm), HV * DV, HID);
-          ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm), HID, HV * DV);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm), QKVW, HID);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm), HV * DV, HID);
+          ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm), HID, HV * DV);
         }
-        ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l), nm), INTM, HID);
-        ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l), nm), INTM, HID);
-        ok &= pool_add((snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm), HID, INTM);
+        ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l), nm), INTM, HID);
+        ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l), nm), INTM, HID);
+        ok &= pool_add_both((snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm), HID, INTM);
       }
       if (ok) fprintf(stderr, "trunk: weight pool resident (%.1f GB)\n", g_wpool_used / 1e9);
       else { hipFree(d_wpool); d_wpool = nullptr; g_wmap.clear(); g_wpool_used = 0;

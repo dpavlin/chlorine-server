@@ -23,12 +23,18 @@ if(HIPCC_EXECUTABLE)
     find_library(OMP_RUNTIME gomp)
   endif()
   set(GEN_OBJ ${CMAKE_CURRENT_BINARY_DIR}/generator.hip.o)
+  set(GEMM_I4_OBJ ${CMAKE_CURRENT_BINARY_DIR}/gemm_i4.hip.o)
+  add_custom_command(OUTPUT ${GEMM_I4_OBJ}
+    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -c
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/gemm_i4.hip -o ${GEMM_I4_OBJ}
+    DEPENDS src/gemm_i4.hip src/gemm_i4.h
+    COMMENT "hipcc gemm_i4.hip -> gfx1151")
   add_custom_command(OUTPUT ${GEN_OBJ}
     COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fopenmp -fPIC -c
             ${CMAKE_CURRENT_SOURCE_DIR}/src/generator.hip -o ${GEN_OBJ}
-    DEPENDS src/generator.hip
+    DEPENDS src/generator.hip src/gemm_i4.h
     COMMENT "hipcc generator.hip -> gfx1151")
-  target_sources(chlorine PRIVATE ${GEN_OBJ})
+  target_sources(chlorine PRIVATE ${GEN_OBJ} ${GEMM_I4_OBJ})
   if(HIP_RUNTIME)
     target_link_libraries(chlorine PRIVATE ${HIP_RUNTIME})
   endif()
