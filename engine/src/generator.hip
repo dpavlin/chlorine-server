@@ -322,12 +322,12 @@ __global__ void k_attn_step(const uint16_t* __restrict__ Qrow, const uint16_t* _
   __shared__ uint16_t sb[CXT + 1];
   int tid = threadIdx.x;
   int kvh = h / (QH / KVH);
-  if (tid <= pos) {
+  for (int t = tid; t <= pos; t += blockDim.x) {
     const uint16_t* qp = Qrow + h * HD;
-    const uint16_t* kp = KC + ((long)tid * KVH + kvh) * HD;
+    const uint16_t* kp = KC + ((long)t * KVH + kvh) * HD;
     float s = 0.f;
     for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
-    sp[tid] = s * SCALE;
+    sp[t] = s * SCALE;
   }
   __syncthreads();
   if (tid == 0) {
