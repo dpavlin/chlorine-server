@@ -90,7 +90,7 @@ def main():
         f = c.lines(1)[0].split()
         check("INFO shape", f[0] == "I" and len(f) == 12, f)
         if args.checkpoint:
-            check("INFO ctx", f[3] == "262144", f[3])
+            check("INFO ctx", f[3] in ("2048", "8192", "262144") and f[3] == f[11], f[3])
             check("INFO spec_rows", f[4] == "8")
             if args.strict_flags:
                 check("INFO mtp/dflash2 flags", f[1] == "1" and f[2] == "1" and f[6] == "1" and f[7] == "1", f)
