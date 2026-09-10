@@ -40,6 +40,7 @@ int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
                              const chlorine_sample_opts* opts);
 void chlorine_trunk_shutdown(void);
 int chlorine_trunk_context_capacity(void);
+int chlorine_trunk_last_cached(void);
 }
 
 bool g_trunk_ready = false;
@@ -100,16 +101,18 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
     send(fd, buf, strlen(buf), MSG_NOSIGNAL);
     return;
   }
+  int n_cached = chlorine_trunk_last_cached();
   char buf[160];
-  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f 0 0 0\n", id,
-           stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms);
+  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f 0 0 0 %d\n", id,
+           stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms, n_cached);
   double prefill_s = prefill_ms / 1000.0;
   double decode_s = decode_ms / 1000.0;
-  double prefill_tps = prefill_s > 0 ? ((double)prompt.size() / prefill_s) : 0.0;
+  int uncached_prompt = (int)prompt.size() - n_cached;
+  double prefill_tps = prefill_s > 0 ? ((double)uncached_prompt / prefill_s) : 0.0;
   double decode_tps = decode_s > 0 ? ((double)n_gen / decode_s) : 0.0;
   double itl_ms = n_gen > 0 ? (decode_ms / (double)n_gen) : 0.0;
-  fprintf(stderr, "serve: [REQ %ld] prompt=%zu comp=%d | prefill: %.2fs (%.1f tok/s) | decode: %.2fs (%.2f tok/s, %.1f ms/tok) | %s\n",
-          id, prompt.size(), n_gen, prefill_s, prefill_tps, decode_s, decode_tps, itl_ms, stop_hit ? "stop" : "length");
+  fprintf(stderr, "serve: [REQ %ld] prompt=%zu (%d cached) comp=%d | prefill: %.2fs (%.1f tok/s) | decode: %.2fs (%.2f tok/s, %.1f ms/tok) | %s\n",
+          id, prompt.size(), n_cached, n_gen, prefill_s, prefill_tps, decode_s, decode_tps, itl_ms, stop_hit ? "stop" : "length");
   size_t off = 0;
   size_t len = strlen(buf);
   while (off < len) {
@@ -224,12 +227,19 @@ int main(int argc, char** argv) {
     chlorine_sample_opts so {};
     so.has_sample = 0;
     auto emit_noop = [](void*, int, float) {};
-    fprintf(stderr, "=== BENCHMARK START: prompt=%d gen=%d ===\n", bench_prompt, bench_gen);
-    int n_gen = chlorine_trunk_generate2(prompt.data(), int(prompt.size()), bench_gen,
-                                         eos.data(), int(eos.size()), emit_noop, nullptr,
-                                         &prefill_ms, &decode_ms, &stop_hit, &so);
-    fprintf(stderr, "=== BENCHMARK END: n_gen=%d prefill=%.2fms decode=%.2fms ===\n",
-            n_gen, prefill_ms, decode_ms);
+    for (int rep = 0; rep < 2; rep++) {
+      prefill_ms = 0; decode_ms = 0; stop_hit = 0;
+      fprintf(stderr, "=== BENCHMARK %s START: prompt=%zu gen=%d ===\n",
+              rep == 0 ? "COLD" : "WARM", prompt.size(), bench_gen);
+      int n_gen = chlorine_trunk_generate2(prompt.data(), int(prompt.size()), bench_gen,
+                                           eos.data(), int(eos.size()), emit_noop, nullptr,
+                                           &prefill_ms, &decode_ms, &stop_hit, &so);
+      int n_cached = chlorine_trunk_last_cached();
+      fprintf(stderr, "=== BENCHMARK %s END: n_gen=%d (cached=%d) prefill=%.2fms decode=%.2fms ===\n",
+              rep == 0 ? "COLD" : "WARM", n_gen, n_cached, prefill_ms, decode_ms);
+      // Append 2 tokens for next run to test warm prefix cache hit
+      prompt.push_back(151644); prompt.push_back(151644);
+    }
   }
   if (g_trunk_ready) chlorine_trunk_shutdown();
   return 0;

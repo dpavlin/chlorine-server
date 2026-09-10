@@ -33,6 +33,26 @@ std::string fmt_d_error(long id) {
   return buf;
 }
 
+struct ChlorineCacheStats {
+  int entries;
+  long long bytes;
+  long long reserved_bytes;
+  long long cap_bytes;
+  long hits;
+  long misses;
+  long stores;
+  long evicted;
+  long tokens_saved;
+  double store_ms_total;
+  double restore_ms_total;
+  double last_store_ms;
+  double last_restore_ms;
+  long refused;
+};
+#ifdef CHLORINE_HAS_TRUNK
+extern "C" void chlorine_trunk_cache_stats(ChlorineCacheStats* out);
+#endif
+
 }  // namespace
 
 Server::Server(const Checkpoint& ckpt, Options opts, GenerateFn gen, void* ctx)
@@ -45,6 +65,11 @@ Server::Server(const Checkpoint& ckpt, Options opts, GenerateFn gen, void* ctx)
   int dw = ckpt_.has_dflash2() ? 1 : 0;
   int df2 = (ckpt_.has_mtp() && ckpt_.has_dflash2()) ? 1 : 0;
   int cache_mb = 0, cache_align = 2048;
+#ifdef CHLORINE_HAS_TRUNK
+  ChlorineCacheStats cst {};
+  chlorine_trunk_cache_stats(&cst);
+  cache_mb = int(cst.cap_bytes / (1024 * 1024));
+#endif
   char buf[256];
   snprintf(buf, sizeof buf, "I %d %d %d %d %d %d %d %d %d %d %d", mtp, dh,
            opts_.slot_ctx, 8, opts_.default_drafter, dw, df2, cache_mb,
@@ -138,10 +163,17 @@ void Server::handle_line(int fd, const std::string& line) {
   } else if (verb == "INFO") {
     send_all(fd, info_line_ + "\n");
   } else if (verb == "CSTAT") {
-    // cache disabled in the skeleton: entries, bytes, reserved, cap, hits,
-    // misses, stores, evicted, tokens_saved, store_ms, restore_ms,
-    // last_store_ms, last_restore_ms, refused
-    send_all(fd, "C 0 0 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0 0\n");
+    ChlorineCacheStats cst {};
+#ifdef CHLORINE_HAS_TRUNK
+    chlorine_trunk_cache_stats(&cst);
+#endif
+    char buf[256];
+    snprintf(buf, sizeof buf, "C %d %lld %lld %lld %ld %ld %ld %ld %ld %.1f %.1f %.1f %.1f %ld\n",
+             cst.entries, cst.bytes, cst.reserved_bytes, cst.cap_bytes,
+             cst.hits, cst.misses, cst.stores, cst.evicted, cst.tokens_saved,
+             cst.store_ms_total, cst.restore_ms_total, cst.last_store_ms, cst.last_restore_ms,
+             cst.refused);
+    send_all(fd, buf);
   } else if (verb == "GEN") {
     handle_gen(fd, in);
   } else if (verb.size() == 1 && verb[0] == 'X') {
