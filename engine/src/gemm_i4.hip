@@ -24,8 +24,9 @@ __device__ inline uint16_t f32bf(float f) {
 }
 
 // -----------------------------------------------------------------------------
-// k_actq: Dynamic activation quantization from BF16 into signed INT4 [-7..7]
-// with 1 FP16 scale per 256 elements along the K dimension.
+// k_actq: Walsh-Hadamard-rotated dynamic activation quantization from BF16
+// into signed INT4 [-7..7] with 1 FP16 scale per 256 elements along K.
+// Matches QuaRot Hadamard-rotated .i4l weights.
 // Grid: ((K + 255) / 256, M), Block: 256 threads
 // -----------------------------------------------------------------------------
 __global__ void k_actq(const uint16_t* __restrict__ X, int rows, int cols,
@@ -37,20 +38,33 @@ __global__ void k_actq(const uint16_t* __restrict__ X, int rows, int cols,
     int tid = threadIdx.x;
     int c = col_blk + tid;
 
-    float val = (c < cols) ? bf16f(X[(long)row * cols + c]) : 0.f;
-    float absv = fabsf(val);
+    __shared__ float sh[256], sm[256];
+    __shared__ uint8_t sc[256];
 
-    // Reduction across 256 threads in shared memory to find group max
-    __shared__ float s_max[256];
-    s_max[tid] = absv;
+    sh[tid] = (c < cols) ? bf16f(X[(long)row * cols + c]) : 0.f;
     __syncthreads();
 
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) s_max[tid] = fmaxf(s_max[tid], s_max[tid + s]);
+    // 256-point fast Walsh-Hadamard transform in-place
+    #pragma unroll
+    for (int len = 1; len < 256; len <<= 1) {
+        float a = sh[tid], b = sh[tid ^ len];
+        __syncthreads();
+        sh[tid] = ((tid & len) ? b - a : a + b);
         __syncthreads();
     }
 
-    float grp_max = s_max[0];
+    float v = sh[tid] * (1.0f / 16.0f);
+    sm[tid] = fabsf(v);
+    __syncthreads();
+
+    // Reduction across 256 threads to find group max
+    #pragma unroll
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] = fmaxf(sm[tid], sm[tid + s]);
+        __syncthreads();
+    }
+
+    float grp_max = sm[0];
     float scale = grp_max / 7.0f;
     float inv_scale = (scale > 1e-8f) ? (1.0f / scale) : 0.0f;
 
@@ -64,20 +78,17 @@ __global__ void k_actq(const uint16_t* __restrict__ X, int rows, int cols,
     // Quantize element to [-7..7]
     int q = 0;
     if (scale > 1e-8f) {
-        q = __float2int_rn(val * inv_scale);
+        q = __float2int_rn(v * inv_scale);
         if (q > 7) q = 7;
         if (q < -7) q = -7;
     }
-    uint8_t nibble = (uint8_t)(q & 0x0F);
-
-    // Pack pairs of adjacent nibbles (tid 2k with tid 2k+1)
-    __shared__ uint8_t s_nib[256];
-    s_nib[tid] = nibble;
+    sc[tid] = (uint8_t)(q & 0x0F);
     __syncthreads();
 
+    // Pack pairs of adjacent nibbles (tid 2k with tid 2k+1)
     if ((tid & 1) == 0 && (c < cols)) {
-        uint8_t lo = s_nib[tid];
-        uint8_t hi = (tid + 1 < 256) ? s_nib[tid + 1] : 0;
+        uint8_t lo = sc[tid];
+        uint8_t hi = (tid + 1 < 256) ? sc[tid + 1] : 0;
         Out_quant[(long)row * (cols / 2) + (c / 2)] = (hi << 4) | (lo & 0x0F);
     }
 }
