@@ -41,17 +41,17 @@ static const int   NPAIR = 32;        // rotary pairs (partial 0.25 -> 64 dims)
 static const float SCALE = 0.0625f;   // 1/sqrt(256)
 static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
-// Context window capacity: default 32K (32,768 tokens), scalable up to 262,144 via HALO_CONTEXT.
+// Context window capacity: default 256K (262,144 tokens), scalable dynamically via HALO_CONTEXT.
 // At 32K context, 16 layers of [KVH=4, HD=256] bf16 KV cache consume 2.14 GB of VRAM.
-// At 256K context, KV cache consumes 17.18 GB of VRAM.
-static int         g_cxt = 32768;     // kv cache capacity (32K default, dynamic)
+// At 256K context, KV cache consumes 17.18 GB of VRAM (comfortably within 128 GB unified RAM).
+static int         g_cxt = 262144;    // kv cache capacity (256K default, dynamic via HALO_CONTEXT)
 static const int   TMAX  = 2048;      // max chunk activation rows (matches upstream Halogen 2K prefill)
 static const char* CKPT  = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
 
 // FlashDecoding (Split-K Attention) buffers:
 // Eliminates sequential 1-token loops and barrier stalls at long context depths.
 static const int   SPLIT_CHUNK = 1024;// 1024 tokens per split in FlashDecoding
-static const int   MAX_SPLITS  = 256; // supports up to 262,144 tokens (256 * 1024)
+static const int   MAX_SPLITS  = 512; // supports up to 524,288 tokens (512 * 1024)
 static float*      d_split_acc = nullptr; // [QH][MAX_SPLITS][HD] partial accumulators
 static float*      d_split_m   = nullptr; // [QH][MAX_SPLITS] partial max scores
 static float*      d_split_l   = nullptr; // [QH][MAX_SPLITS] partial normalizers
