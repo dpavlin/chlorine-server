@@ -161,7 +161,8 @@ void build_info(const Checkpoint& ckpt) {
 int main(int argc, char** argv) {
   std::string ckpt_path, bind = "127.0.0.1";
   int port = 8730;
-  bool do_serve = false, do_info = false;
+  bool do_serve = false, do_info = false, do_bench = false;
+  int bench_prompt = 2048, bench_gen = 10;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&](const char* what) -> const char* {
@@ -173,14 +174,19 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = atoi(next("--port"));
     else if (a == "--bind") bind = next("--bind");
     else if (a == "--build-info") do_info = true;
-    else { fprintf(stderr, "unknown flag %s\nusage: chlorine --checkpoint FILE.hgn [--build-info] [--serve [--port N] [--bind ADDR]]\n", a.c_str()); return 2; }
+    else if (a == "--bench") {
+      do_bench = true;
+      bench_prompt = atoi(next("--bench"));
+      bench_gen = atoi(next("gen_tokens"));
+    }
+    else { fprintf(stderr, "unknown flag %s\nusage: chlorine --checkpoint FILE.hgn [--build-info] [--serve [--port N] [--bind ADDR]] [--bench PROMPT_LEN GEN_TOKENS]\n", a.c_str()); return 2; }
   }
-  if (!do_serve && !do_info) {
-    fprintf(stderr, "usage: chlorine --checkpoint FILE.hgn [--build-info] [--serve [--port N] [--bind ADDR]]\n");
+  if (!do_serve && !do_info && !do_bench) {
+    fprintf(stderr, "usage: chlorine --checkpoint FILE.hgn [--build-info] [--serve [--port N] [--bind ADDR]] [--bench PROMPT_LEN GEN_TOKENS]\n");
     return 2;
   }
-  if (ckpt_path.empty() && do_serve) {
-    fprintf(stderr, "--serve needs --checkpoint\n");
+  if (ckpt_path.empty() && (do_serve || do_bench)) {
+    fprintf(stderr, "%s needs --checkpoint\n", do_bench ? "--bench" : "--serve");
     return 2;
   }
   if (ckpt_path.empty()) {
@@ -206,6 +212,24 @@ int main(int argc, char** argv) {
                                                                   : stub_generate,
                nullptr);
     svr.serve();
+  }
+  if (do_bench) {
+    if (!g_trunk_ready && !ckpt_path.empty())
+      g_trunk_ready = chlorine_trunk_init(ckpt_path.c_str()) == 0;
+    if (!g_trunk_ready) { fprintf(stderr, "trunk init failed\n"); return 1; }
+    std::vector<int> prompt(bench_prompt, 151644);
+    std::vector<int> eos = {151645};
+    double prefill_ms = 0, decode_ms = 0;
+    int stop_hit = 0;
+    chlorine_sample_opts so {};
+    so.has_sample = 0;
+    auto emit_noop = [](void*, int, float) {};
+    fprintf(stderr, "=== BENCHMARK START: prompt=%d gen=%d ===\n", bench_prompt, bench_gen);
+    int n_gen = chlorine_trunk_generate2(prompt.data(), int(prompt.size()), bench_gen,
+                                         eos.data(), int(eos.size()), emit_noop, nullptr,
+                                         &prefill_ms, &decode_ms, &stop_hit, &so);
+    fprintf(stderr, "=== BENCHMARK END: n_gen=%d prefill=%.2fms decode=%.2fms ===\n",
+            n_gen, prefill_ms, decode_ms);
   }
   if (g_trunk_ready) chlorine_trunk_shutdown();
   return 0;
