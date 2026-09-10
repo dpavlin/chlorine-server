@@ -41,8 +41,8 @@ static const int   NPAIR = 32;        // rotary pairs (partial 0.25 -> 64 dims)
 static const float SCALE = 0.0625f;   // 1/sqrt(256)
 static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
-static const int   CXT   = 448;      // kv cache capacity (>= 348 u16-seq prefill + 24 decode)
-static const int   TMAX  = 352;      // activation rows (>= 348 forced-seq)
+static const int   CXT   = 8192;      // kv cache capacity (8K context)
+static const int   TMAX  = 512;       // max chunk activation rows (>= 128 prefill chunk)
 static const char* CKPT  = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
 
 static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved (2p, 2p+1)
@@ -220,14 +220,21 @@ __global__ void k_add(const uint16_t* __restrict__ A, const uint16_t* __restrict
 
 // ---------------- conv1d (causal, kernel 4, groups, silu) ----------------
 __global__ void k_conv1d(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
-                         uint16_t* __restrict__ O, long T) {
+                         uint16_t* __restrict__ O, long T, const uint16_t* __restrict__ st = nullptr,
+                         int pos_base = 0) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
   if (i >= T * QKVW) return;
   int t = (int)(i / QKVW), c = (int)(i % QKVW);
   float acc = 0.f;
   for (int j = 0; j < 4; j++) {
     int tt = t + j - 3;
-    if (tt >= 0) acc = fmaf(bf16f(Wc[c * 4 + j]), bf16f(X[(long)tt * QKVW + c]), acc);
+    float xv = 0.f;
+    if (tt >= 0) {
+      xv = bf16f(X[(long)tt * QKVW + c]);
+    } else if (pos_base > 0 && st) {
+      xv = bf16f(st[c * 3 + (3 + tt)]);
+    }
+    acc = fmaf(bf16f(Wc[c * 4 + j]), xv, acc);
   }
   float inv = 1.0f / (1.0f + expf(-acc));
   O[i] = f32bf(acc * inv);
@@ -289,73 +296,80 @@ __global__ void k_kvwrite(const uint16_t* __restrict__ S, uint16_t* __restrict__
   KC[((long)(pos_base + t) * KVH + h) * HD + d] = S[i];
 }
 
-// ---------------- FA attention ----------------
-__global__ void k_attn_scores(const uint16_t* __restrict__ Q, const uint16_t* __restrict__ KC,
-                              float* __restrict__ S, int T, int Tmax) {
-  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
-  if (i >= (long)QH * T * T) return;
-  int j = (int)(i % T), t = (int)((i / T) % T), h = (int)(i / ((long)T * T));
-  if (j > t) return;
+// ---------------- Fused Online FlashAttention Kernel ----------------
+// Evaluates causal attention over KV cache positions [0..pos_base+t]
+// Block: 256 threads (1 thread per feature dimension d, HD=256)
+// Grid: dim3(QH, T)
+// LDS usage: 1.1 KB (constant, O(1) in context length)
+__global__ void k_attn_fused_online(const uint16_t* __restrict__ Q,
+                                    const uint16_t* __restrict__ KC,
+                                    const uint16_t* __restrict__ VC,
+                                    uint16_t* __restrict__ Out,
+                                    int pos_base, int T) {
+  int h = blockIdx.x;
+  int t = blockIdx.y;
+  if (h >= QH || t >= T) return;
+
+  int pos = pos_base + t;
+  int tid = threadIdx.x; // 0..255
   int kvh = h / (QH / KVH);
+
   const uint16_t* qp = Q + ((long)t * QH + h) * HD;
-  const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
-  float s = 0.f;
-  for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
-  S[(long)h * Tmax * Tmax + (long)t * Tmax + j] = s * SCALE;
-}
-__global__ void k_attn_softmax(const float* __restrict__ S, uint16_t* __restrict__ Pbf, int T, int Tmax) {
-  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
-  if (i >= (long)QH * T) return;
-  int t = (int)(i % T), h = (int)(i / T);
-  const float* row = S + (long)h * Tmax * Tmax + (long)t * Tmax;
-  uint16_t* pb = Pbf + (long)h * Tmax * Tmax + (long)t * Tmax;
-  float mx = -3.0e38f;
-  for (int j = 0; j <= t; j++) mx = fmaxf(mx, row[j]);
-  float sum = 0.f;
-  for (int j = 0; j <= t; j++) sum += expf(row[j] - mx);
-  float inv = 1.0f / sum;
-  for (int j = 0; j <= t; j++) pb[j] = f32bf(expf(row[j] - mx) * inv);
-}
-__global__ void k_attn_pv(const uint16_t* __restrict__ Pbf, const uint16_t* __restrict__ VC,
-                          uint16_t* __restrict__ O, int T, int Tmax) {
-  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
-  if (i >= (long)T * QH * HD) return;
-  int d = (int)(i % HD), h = (int)((i / HD) % QH), t = (int)(i / ((long)QH * HD));
-  int kvh = h / (QH / KVH);
-  const uint16_t* pb = Pbf + (long)h * Tmax * Tmax + (long)t * Tmax;
-  float acc = 0.f;
-  for (int j = 0; j <= t; j++) acc += bf16f(pb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + d]);
-  O[((long)t * QH + h) * HD + d] = f32bf(acc);
-}
-__global__ void k_attn_step(const uint16_t* __restrict__ Qrow, const uint16_t* __restrict__ KC,
-                            const uint16_t* __restrict__ VC, uint16_t* __restrict__ Orow, int pos) {
-  int h = blockIdx.x; if (h >= QH) return;
-  __shared__ float sp[CXT + 1];
-  __shared__ uint16_t sb[CXT + 1];
-  int tid = threadIdx.x;
-  int kvh = h / (QH / KVH);
-  for (int t = tid; t <= pos; t += blockDim.x) {
-    const uint16_t* qp = Qrow + h * HD;
-    const uint16_t* kp = KC + ((long)t * KVH + kvh) * HD;
-    float s = 0.f;
-    for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
-    sp[t] = s * SCALE;
+  float q_val = bf16f(qp[tid]);
+
+  __shared__ float s_k[256];
+  __shared__ float s_wave_sum[8];
+
+  int wave_id = tid / 32;
+  int lane_id = tid % 32;
+
+  float m_prev = -3.0e38f;
+  float l_prev = 0.0f;
+  float acc = 0.0f;
+
+  for (int j = 0; j <= pos; j++) {
+    const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
+    s_k[tid] = bf16f(kp[tid]);
+    __syncthreads();
+
+    float prod = q_val * s_k[tid];
+
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      prod += __shfl_xor(prod, mask, 32);
+    }
+
+    if (lane_id == 0) s_wave_sum[wave_id] = prod;
+    __syncthreads();
+
+    if (wave_id == 0) {
+      float dot = (lane_id < 8) ? s_wave_sum[lane_id] : 0.f;
+      #pragma unroll
+      for (int mask = 4; mask > 0; mask >>= 1) {
+        dot += __shfl_xor(dot, mask, 32);
+      }
+      if (lane_id == 0) s_wave_sum[0] = dot * SCALE;
+    }
+    __syncthreads();
+
+    float score = s_wave_sum[0];
+
+    float m_new = fmaxf(m_prev, score);
+    float alpha = expf(m_prev - m_new);
+    float w = expf(score - m_new);
+
+    l_prev = l_prev * alpha + w;
+    acc = acc * alpha;
+
+    const uint16_t* vp = VC + ((long)j * KVH + kvh) * HD;
+    acc += w * bf16f(vp[tid]);
+
+    m_prev = m_new;
   }
-  __syncthreads();
-  if (tid == 0) {
-    float mx = -3.0e38f;
-    for (int j = 0; j <= pos; j++) mx = fmaxf(mx, sp[j]);
-    float sum = 0.f;
-    for (int j = 0; j <= pos; j++) { float e = expf(sp[j] - mx); sp[j] = e; sum += e; }
-    float inv = 1.0f / sum;
-    for (int j = 0; j <= pos; j++) sb[j] = f32bf(sp[j] * inv);
-  }
-  __syncthreads();
-  if (tid < HD) {
-    float acc = 0.f;
-    for (int j = 0; j <= pos; j++) acc += bf16f(sb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + tid]);
-    Orow[h * HD + tid] = f32bf(acc);
-  }
+
+  float inv_l = (l_prev > 0.f) ? (1.0f / l_prev) : 0.0f;
+  uint16_t* op = Out + ((long)t * QH + h) * HD;
+  op[tid] = f32bf(acc * inv_l);
 }
 
 // ---------------- FA output gate ----------------
@@ -405,6 +419,108 @@ __global__ void k_gdn_gates(const uint16_t* __restrict__ ABa, const uint16_t* __
   Gout[i] = G;
   Bout[i] = beta;
 }
+
+// ---------------- GatedDeltaNet GPU scan ----------------
+__global__ void k_gdn_scan_gpu(const uint16_t* __restrict__ qkvc,
+                               const float* __restrict__ GateG,
+                               const float* __restrict__ GateB,
+                               float* __restrict__ d_S,
+                               uint16_t* __restrict__ Out,
+                               int T, float qscale) {
+  int hh = blockIdx.x; // 0..47 (head index)
+  if (hh >= HV) return;
+
+  int j = threadIdx.x; // 0..127 (column index)
+
+  float* S_head = d_S + (long)hh * DK * DV;
+
+  // Load column j of S into registers
+  float S_col[128];
+  #pragma unroll 4
+  for (int i = 0; i < 128; i++) {
+    S_col[i] = S_head[i * 128 + j];
+  }
+
+  __shared__ float s_q[128];
+  __shared__ float s_k[128];
+  __shared__ float s_qs_wave[4];
+  __shared__ float s_ks_wave[4];
+
+  int wave_id = j / 32;
+  int lane_id = j % 32;
+
+  for (int t = 0; t < T; t++) {
+    const uint16_t* qp = qkvc + (long)t * QKVW + (hh / 3) * DK;
+    const uint16_t* kp = qkvc + (long)t * QKVW + HK * DK + (hh / 3) * DK;
+    const uint16_t* vp = qkvc + (long)t * QKVW + HK * DK * 2 + hh * DV;
+
+    float q_val = bf16f(qp[j]);
+    float k_val = bf16f(kp[j]);
+    float v_val = bf16f(vp[j]);
+
+    float qs_part = q_val * q_val;
+    float ks_part = k_val * k_val;
+
+    // Intra-wave reduction
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      qs_part += __shfl_xor(qs_part, mask, 32);
+      ks_part += __shfl_xor(ks_part, mask, 32);
+    }
+
+    if (lane_id == 0) {
+      s_qs_wave[wave_id] = qs_part;
+      s_ks_wave[wave_id] = ks_part;
+    }
+    __syncthreads();
+
+    // Wave 0 combines across 4 waves
+    if (wave_id == 0 && lane_id == 0) {
+      float total_qs = s_qs_wave[0] + s_qs_wave[1] + s_qs_wave[2] + s_qs_wave[3];
+      float total_ks = s_ks_wave[0] + s_ks_wave[1] + s_ks_wave[2] + s_ks_wave[3];
+      s_qs_wave[0] = 1.0f / sqrtf(total_qs + EPS) * qscale;
+      s_ks_wave[0] = 1.0f / sqrtf(total_ks + EPS);
+    }
+    __syncthreads();
+
+    float qi = s_qs_wave[0];
+    float ki = s_ks_wave[0];
+
+    s_q[j] = q_val * qi;
+    s_k[j] = k_val * ki;
+    __syncthreads();
+
+    float decay = expf(GateG[(long)t * HV + hh]);
+    float beta  = GateB[(long)t * HV + hh];
+
+    // Recurrence step
+    float k_pred = 0.f;
+    #pragma unroll 4
+    for (int i = 0; i < 128; i++) {
+      S_col[i] *= decay;
+      k_pred += s_k[i] * S_col[i];
+    }
+
+    float vn = beta * (v_val - k_pred);
+
+    float out_j = 0.f;
+    #pragma unroll 4
+    for (int i = 0; i < 128; i++) {
+      S_col[i] += s_k[i] * vn;
+      out_j += s_q[i] * S_col[i];
+    }
+
+    Out[(long)t * (HV * DV) + hh * DV + j] = f32bf(out_j);
+    __syncthreads();
+  }
+
+  // Store column j of S back to device memory
+  #pragma unroll 4
+  for (int i = 0; i < 128; i++) {
+    S_head[i * 128 + j] = S_col[i];
+  }
+}
+
 
 // ---------------- MLP act ----------------
 // engine-default W4A4: activations quantized before the q4c GEMMs (k_actq).
@@ -844,12 +960,18 @@ static void gemm_dispatch(const uint16_t* A, const char* name, const uint16_t* f
   char nm_i4l[160];
   snprintf(nm_i4l, sizeof(nm_i4l), "%s.i4l", name);
   auto it = g_wmap.find(nm_i4l);
-  if (it != g_wmap.end() && it->second.dt == 8 && d_Aq_ws && d_As_ws && (size_t)M <= 8192) {
+  if (!getenv("HALO_NO_WMMA_I4") && it != g_wmap.end() && it->second.dt == 8 && d_Aq_ws && d_As_ws && (size_t)M <= 8192) {
     const WEnt& w = it->second;
     const uint8_t* W_q = d_wpool + w.off;
     const uint16_t* W_s = reinterpret_cast<const uint16_t*>(d_wpool + w.off + (long)N * (K / 2));
     chlorine::gemm_i4_fused(A, W_q, W_s, C, M, N, K, d_Aq_ws, d_As_ws);
     return;
+  }
+  static int warned = 0;
+  if (warned < 10) {
+    printf("[gemm_dispatch fallback] %s -> fallback gemm (in_map=%d, dt=%d)\n",
+           name, (it != g_wmap.end()), (it != g_wmap.end() ? it->second.dt : -1));
+    warned++;
   }
   gemm(A, fallback_W, C, M, N, K);
 }
@@ -1029,13 +1151,13 @@ static uint16_t *d_q, *d_k, *d_v, *d_o;
 static uint16_t *d_gate, *d_up, *d_down;
 static uint8_t* d_qc; static uint16_t* d_qs;
 static uint16_t *d_convstate;                 // [48][10240][3]
+static float *d_S;                            // [48][48][128][128] GDN state f32
 static uint16_t *d_kcache, *d_vcache;         // [16][CXT][4][256]
 static uint16_t *d_x, *d_ln1, *d_ln2, *d_tmp1;
 static uint16_t *d_qkvraw, *d_qkvc, *d_ab_a, *d_ab_b, *d_zout, *d_co, *d_gn;
 static uint16_t *d_qg, *d_kk, *d_vv, *d_att, *d_qn, *d_kn;
 static uint16_t *d_g17, *d_u17, *d_act;
-static float *d_scores, *d_logits;
-static uint16_t *d_pbf;
+static float *d_logits;
 static int *d_tok, *d_tgt, *d_pred;
 static float *d_nll;
 
@@ -1384,7 +1506,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm), d_z, d_zout, T, HV * DV, HID);
       } }
       if (T > 1) {
-        k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
+        k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T,
+                                                 d_convstate + (long)gi * QKVW * 3, pos_base);
         k_conv_setstate<<<QKVW / 256, 256>>>(d_qkvraw, d_convstate + (long)gi * QKVW * 3, T);
       } else {
         k_conv1d_step<<<QKVW / 256, 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc,
@@ -1392,56 +1515,24 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       }
       gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
       gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
-      CK(hipDeviceSynchronize());
-      { const char* dp = getenv("HALO_DUMP_QKVRAW");
-        if (dp && l == 0) { void* hb = malloc((long)T * QKVW * 2);
-          CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvraw, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
-          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, (long)T * QKVW * 2, f); fclose(f); free(hb); } }
-      { const char* dp = getenv("HALO_DUMP_QKVC");
-        if (dp && l == 0) { void* hb = malloc(4096);
-          CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvc, 4096, hipMemcpyDeviceToHost));
-          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 4096, f); fclose(f); free(hb); } }
-      CK(hipMemcpy(h_qkvbf, d_qkvc, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
-      CK(hipMemcpy(h_abbf, d_ab_a, (long)T * HV * 2, hipMemcpyDeviceToHost));
-      for (long i = 0; i < (long)T * HV; i++) h_af[i] = h_bf16f(h_abbf[i]);
-      CK(hipMemcpy(h_abbf, d_ab_b, (long)T * HV * 2, hipMemcpyDeviceToHost));
-      for (long i = 0; i < (long)T * HV; i++) h_bf[i] = h_bf16f(h_abbf[i]);
-      double ts = now_s();
       k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
                                                 d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
-      CK(hipDeviceSynchronize());
-      CK(hipMemcpy(h_gateG_dev, d_gateG, (long)T * HV * 4, hipMemcpyDeviceToHost));
-      CK(hipMemcpy(h_gateB_dev, d_gateB, (long)T * HV * 4, hipMemcpyDeviceToHost));
-      { const char* dp = getenv("HALO_DUMP_GB");
-        if (dp && l == 0) { void* hb = malloc(4096 * 2);
-          CK(hipMemcpy(hb, d_gateG, 4096, hipMemcpyDeviceToHost));
-          CK(hipMemcpy((char*)hb + 4096, d_gateB, 4096, hipMemcpyDeviceToHost));
-          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 8192, f); fclose(f); free(hb); } }
-      { const char* dp = getenv("HALO_DUMP_AB");
-        if (dp && l == 0) { FILE* f = fopen(dp, "wb");
-          fwrite(h_af, 4, 1024, f); fwrite(h_bf, 4, 1024, f); fclose(f); } }
-      gdn_scan(T, h_qkvbf, h_af, h_bf, gi, h_co);
-      double tscan = now_s() - ts;
-      if (g_dbg) {
-        double qm = 0, cm = 0, am = 0, bm = 0;
-        for (long i = 0; i < (long)T * QKVW; i++) {
-          float v = h_bf16f(h_qkvbf[i]);
-          if (fabs(v) > qm) qm = fabs(v);
-        }
-        for (long i = 0; i < (long)T * HV * DV; i++) {
-          float v = h_bf16f(h_co[i]);
-          if (fabs(v) > cm) cm = fabs(v);
-        }
-        for (long i = 0; i < (long)T * HV; i++) {
-          am = fmax(am, fabs(h_af[i]));
-          bm = fmax(bm, fabs(h_bf[i]));
-        }
-        printf("  L%d gdn: qkvconv_max=%.3g co_max=%.3g a_max=%.3g b_max=%.3g g0=%.4g beta0=%.4g\n",
-               l, qm, cm, am, bm,
-               -expf(h_alog[(long)gdn_ord(l) * HV]) * softplusf(h_af[0] + h_dtbias[(long)gdn_ord(l) * HV]),
-               1.f / (1.f + expf(-h_bf[0])));
+      double ts = now_s();
+      if (getenv("HALO_GDN_CPU")) {
+        CK(hipMemcpy(h_qkvbf, d_qkvc, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(h_abbf, d_ab_a, (long)T * HV * 2, hipMemcpyDeviceToHost));
+        for (long i = 0; i < (long)T * HV; i++) h_af[i] = h_bf16f(h_abbf[i]);
+        CK(hipMemcpy(h_abbf, d_ab_b, (long)T * HV * 2, hipMemcpyDeviceToHost));
+        for (long i = 0; i < (long)T * HV; i++) h_bf[i] = h_bf16f(h_abbf[i]);
+        CK(hipMemcpy(h_gateG_dev, d_gateG, (long)T * HV * 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(h_gateB_dev, d_gateB, (long)T * HV * 4, hipMemcpyDeviceToHost));
+        gdn_scan(T, h_qkvbf, h_af, h_bf, gi, h_co);
+        up(d_co, h_co, (long)T * HV * DV * 2);
+      } else {
+        k_gdn_scan_gpu<<<HV, 128>>>(d_qkvc, d_gateG, d_gateB, d_S + (long)gi * HV * DK * DV, d_co, T, h_qscale);
       }
-      up(d_co, h_co, (long)T * HV * DV * 2);
+      double tscan = now_s() - ts;
+      k_gdn_gatednorm<<<GRID1((long)T * HV), 256>>>(d_co, d_zout, d_gdn_norm + (long)gi * DV, d_gn, T);
       { const char* dp = getenv("HALO_DUMP_CO");
         if (dp && l == 0) { void* hb = malloc(2048);
           CK(hipMemcpy(hb, d_co, 2048, hipMemcpyDeviceToHost));
@@ -1477,13 +1568,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       uint16_t* vc = d_vcache + (long)gi * CXT * KVH * HD;
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, kc, T, pos_base);
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, vc, T, pos_base);
-      if (T > 1) {
-        k_attn_scores<<<GRID1((long)QH * T * T), 256>>>(d_qn, kc, d_scores, T, CXT);
-        k_attn_softmax<<<GRID1((long)QH * T), 256>>>(d_scores, d_pbf, T, CXT);
-        k_attn_pv<<<GRID1((long)T * QH * HD), 256>>>(d_pbf, vc, d_att, T, CXT);
-      } else {
-        k_attn_step<<<QH, 256>>>(d_qn, kc, vc, d_att, pos_base);
-      }
+      k_attn_fused_online<<<dim3(QH, (unsigned)T), 256>>>(d_qn, kc, vc, d_att, pos_base, T);
       k_fa_gate<<<GRID1((long)T * QH * HD), 256>>>(d_att, d_qg, T);
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq(d_att, nm, d_tmp1);
@@ -1563,7 +1648,8 @@ static void trunk_reset_states() {
   CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));
   CK(hipMemset(d_kcache, 0, (long)16 * CXT * KVH * HD * 2));
   CK(hipMemset(d_vcache, 0, (long)16 * CXT * KVH * HD * 2));
-  memset(h_S, 0, (size_t)48 * HV * DK * DV * 4);
+  CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
+  if (h_S) memset(h_S, 0, (size_t)48 * HV * DK * DV * 4);
 }
 
 extern "C" int chlorine_trunk_init(const char* ckpt_path) {
@@ -1580,7 +1666,12 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipSetDevice(0));
 
   double t0 = now_s();
+  if (getenv("HALO_CKPT")) ckpt_path = getenv("HALO_CKPT");
   g_f = fopen(ckpt_path, "rb");
+  if (!g_f && strcmp(ckpt_path, "/home/dpavlin/models/qwen3.8-27b-p1w4d-d2.hgn") != 0) {
+    ckpt_path = "/home/dpavlin/models/qwen3.8-27b-p1w4d-d2.hgn";
+    g_f = fopen(ckpt_path, "rb");
+  }
   if (!g_f) { fprintf(stderr, "trunk: cannot open %s\n", ckpt_path); return -1; }
   load_table();
   fprintf(stderr, "trunk: table %zu tensors\n", g_tbl.size());
@@ -1674,6 +1765,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
 
   CK(hipMalloc((void**)&d_convstate, (long)48 * QKVW * 3 * 2));
   CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));
+  CK(hipMalloc((void**)&d_S, (size_t)48 * HV * DK * DV * 4));
+  CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
   CK(hipMalloc((void**)&d_kcache, (long)16 * CXT * KVH * HD * 2));
   CK(hipMalloc((void**)&d_vcache, (long)16 * CXT * KVH * HD * 2));
   CK(hipMemset(d_kcache, 0, (long)16 * CXT * KVH * HD * 2));
@@ -1700,10 +1793,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_g17, (long)TMAX * INTM * 2));
   CK(hipMalloc((void**)&d_u17, (long)TMAX * INTM * 2));
   CK(hipMalloc((void**)&d_act, (long)TMAX * INTM * 2));
-  CK(hipMalloc((void**)&d_scores, (long)QH * CXT * CXT * 4));
-  CK(hipMalloc((void**)&d_pbf, (long)QH * CXT * CXT * 2));
   CK(hipMalloc((void**)&d_logits, (long)TMAX * VOC * 4));
-  CK(hipMalloc((void**)&d_tok, TMAX * 4));
+  CK(hipMalloc((void**)&d_tok, (long)CXT * 4));
   CK(hipMalloc((void**)&d_tgt, TMAX * 4));
   CK(hipMalloc((void**)&d_pred, TMAX * 4));
   CK(hipMalloc((void**)&d_nll, TMAX * 4));
@@ -1808,17 +1899,24 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
                                        void (*emit)(void*, int), void* ctx,
                                        double* prefill_ms, double* decode_ms, int* stop_hit) {
   if (!g_ready) return -1;
-  if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1) return -2;
+  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1) return -2;
   if (max_tokens > (long)(CXT - n_prompt)) max_tokens = (long)(CXT - n_prompt);
   trunk_reset_states();
   double tp = now_s();
   up(d_tok, prompt, (size_t)n_prompt * 4);
-  forward(d_tok, n_prompt, 0, 1);
+  const int CHUNK_SIZE = 128;
+  int last_chunk_T = 0;
+  for (int p0 = 0; p0 < n_prompt; p0 += CHUNK_SIZE) {
+    int chunk_T = std::min(CHUNK_SIZE, n_prompt - p0);
+    int want_logits = (p0 + chunk_T == n_prompt) ? 1 : 0;
+    forward(d_tok + p0, chunk_T, p0, want_logits);
+    if (want_logits) last_chunk_T = chunk_T;
+  }
   *prefill_ms = (now_s() - tp) * 1000.0;
 
   double td = now_s();
   int n_gen = 0, tok = 0, stop = 0;
-  k_argmax1<<<1, 256>>>(d_logits + (long)(n_prompt - 1) * VOC, d_pred, VOC);
+  k_argmax1<<<1, 256>>>(d_logits + (long)(last_chunk_T - 1) * VOC, d_pred, VOC);
   CK(hipDeviceSynchronize());
   CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
   while (!stop && n_gen < max_tokens) {
@@ -1990,7 +2088,7 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
                                         double* prefill_ms, double* decode_ms, int* stop_hit,
                                         const chlorine_sample_opts* opts) {
   if (!g_ready) return -1;
-  if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1) return -2;
+  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1) return -2;
   if (max_tokens > (long)(CXT - n_prompt)) max_tokens = (long)(CXT - n_prompt);
   bool sample = opts && opts->has_sample;
   static std::vector<int> counts;
@@ -1998,18 +2096,25 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
   trunk_reset_states();
   double tp = now_s();
   up(d_tok, prompt, (size_t)n_prompt * 4);
-  forward(d_tok, n_prompt, 0, 1);
+  const int CHUNK_SIZE = 128;
+  int last_chunk_T = 0;
+  for (int p0 = 0; p0 < n_prompt; p0 += CHUNK_SIZE) {
+    int chunk_T = std::min(CHUNK_SIZE, n_prompt - p0);
+    int want_logits = (p0 + chunk_T == n_prompt) ? 1 : 0;
+    forward(d_tok + p0, chunk_T, p0, want_logits);
+    if (want_logits) last_chunk_T = chunk_T;
+  }
   *prefill_ms = (now_s() - tp) * 1000.0;
 
   double td = now_s();
   int n_gen = 0, tok = 0, stop = 0;
   float logp = 0.f;
   if (sample) {
-    chlorine_sample_host(d_logits + (long)(n_prompt - 1) * VOC, counts.data(),
+    chlorine_sample_host(d_logits + (long)(last_chunk_T - 1) * VOC, counts.data(),
                          (unsigned)n_prompt, opts, &tok, &logp);
     counts[tok]++;
   } else {
-    k_argmax1<<<1, 256>>>(d_logits + (long)(n_prompt - 1) * VOC, d_pred, VOC);
+    k_argmax1<<<1, 256>>>(d_logits + (long)(last_chunk_T - 1) * VOC, d_pred, VOC);
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
   }
@@ -2045,5 +2150,5 @@ extern "C" int chlorine_trunk_context_capacity(void) {
 }
 
 extern "C" int chlorine_trunk_tmax(void) {
-  return TMAX;
+  return CXT - 2;
 }
