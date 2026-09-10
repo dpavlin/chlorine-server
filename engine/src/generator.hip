@@ -54,7 +54,7 @@ __device__ inline float bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; retu
 __device__ inline uint16_t f32bf(float f) {
   uint32_t u = __float_as_uint(f);
   uint32_t lo = u & 0xFFFFu;
-  u = (u >> 16) + ((lo > 0x7FFFu) | ((lo == 0x7FFFu) & ((u >> 16) & 1u)));
+  u = (u >> 16) + (lo > 0x8000u) + ((lo == 0x8000u) & ((u >> 16) & 1u));
   return (uint16_t)(u & 0xFFFFu);
 }
 static inline float h_bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
@@ -118,12 +118,13 @@ __global__ void k_gemm(const uint16_t* __restrict__ A, const uint16_t* __restric
         sa[ty][c] = (m < M && k < K) ? A[(long)m * K + k] : (uint16_t)0;
       }
       __syncthreads();
-      for (int kk = 0; kk < 64; kk++) {
-        float av = bf16f(sa[ty][kk]);
-        acc[mt][0] += av * bf16f(sw[tx][kk]);
-        acc[mt][1] += av * bf16f(sw[tx + 16][kk]);
-        acc[mt][2] += av * bf16f(sw[tx + 32][kk]);
-        acc[mt][3] += av * bf16f(sw[tx + 48][kk]);
+      // BLASLt MI16x16x1 emulation: wmma accumulates k as ascending pair-sums
+      for (int kk = 0; kk < 64; kk += 2) {
+        float a0 = bf16f(sa[ty][kk]), a1 = bf16f(sa[ty][kk + 1]);
+        acc[mt][0] += (a0 * bf16f(sw[tx][kk]) + a1 * bf16f(sw[tx][kk + 1]));
+        acc[mt][1] += (a0 * bf16f(sw[tx + 16][kk]) + a1 * bf16f(sw[tx + 16][kk + 1]));
+        acc[mt][2] += (a0 * bf16f(sw[tx + 32][kk]) + a1 * bf16f(sw[tx + 32][kk + 1]));
+        acc[mt][3] += (a0 * bf16f(sw[tx + 48][kk]) + a1 * bf16f(sw[tx + 48][kk + 1]));
       }
       __syncthreads();
     }
@@ -138,6 +139,18 @@ __global__ void k_gemm(const uint16_t* __restrict__ A, const uint16_t* __restric
       else C[(long)m * N + n] = f32bf(acc[mt][e]);
     }
   }
+}
+static void dumpx(const uint16_t* d_x) {
+  static int xi = 0; static FILE* xf = 0;
+  const char* dxp = getenv("HALO_DUMP_X");
+  if (!dxp) return;
+  if (!xf) xf = fopen(dxp, "wb");
+  void* hb = malloc(512);
+  CK(hipMemcpy(hb, d_x, 512, hipMemcpyDeviceToHost));
+  int idx = xi++;
+  fwrite(&idx, 4, 1, xf);
+  fwrite(hb, 1, 512, xf);
+  free(hb);
 }
 static void gemm(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N, int K) {
   dim3 b(16, 16);
@@ -214,23 +227,21 @@ __global__ void k_conv1d(const uint16_t* __restrict__ X, const uint16_t* __restr
   float acc = 0.f;
   for (int j = 0; j < 4; j++) {
     int tt = t + j - 3;
-    if (tt >= 0) acc += bf16f(Wc[c * 4 + j]) * bf16f(X[(long)tt * QKVW + c]);
+    if (tt >= 0) acc = fmaf(bf16f(Wc[c * 4 + j]), bf16f(X[(long)tt * QKVW + c]), acc);
   }
-  uint16_t yb = f32bf(acc);
-  float yf = bf16f(yb);
-  O[i] = f32bf(yf / (1.0f + expf(-yf)));
+  float inv = 1.0f / (1.0f + expf(-acc));
+  O[i] = f32bf(acc * inv);
 }
 __global__ void k_conv1d_step(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
                               uint16_t* __restrict__ O, uint16_t* __restrict__ st) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= QKVW) return;
-  float acc = bf16f(st[c * 3 + 0]) * bf16f(Wc[c * 4 + 0])
-            + bf16f(st[c * 3 + 1]) * bf16f(Wc[c * 4 + 1])
-            + bf16f(st[c * 3 + 2]) * bf16f(Wc[c * 4 + 2])
-            + bf16f(X[c])          * bf16f(Wc[c * 4 + 3]);
-  uint16_t yb = f32bf(acc);
-  float yf = bf16f(yb);
-  O[c] = f32bf(yf / (1.0f + expf(-yf)));
+  float acc = fmaf(bf16f(st[c * 3 + 0]), bf16f(Wc[c * 4 + 0]), 0.0f);
+  acc = fmaf(bf16f(st[c * 3 + 1]), bf16f(Wc[c * 4 + 1]), acc);
+  acc = fmaf(bf16f(st[c * 3 + 2]), bf16f(Wc[c * 4 + 2]), acc);
+  acc = fmaf(bf16f(X[c]), bf16f(Wc[c * 4 + 3]), acc);
+  float inv = 1.0f / (1.0f + expf(-acc));
+  O[c] = f32bf(acc * inv);
   st[c * 3 + 0] = st[c * 3 + 1];
   st[c * 3 + 1] = st[c * 3 + 2];
   st[c * 3 + 2] = X[c];
@@ -379,6 +390,22 @@ __global__ void k_gdn_gatednorm(const uint16_t* __restrict__ CO, const uint16_t*
   }
 }
 
+// exact device gate computation (matches engine k_dn_gates semantics)
+__global__ void k_gdn_gates(const uint16_t* __restrict__ ABa, const uint16_t* __restrict__ ABb,
+                            const float* __restrict__ al, const float* __restrict__ dt,
+                            float* __restrict__ Gout, float* __restrict__ Bout, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int h = (int)(i % HV);
+  float a = bf16f(ABa[i]) + dt[h];
+  float sp = a > 20.0f ? a : log1pf(expf(a));
+  float G = -expf(al[h]) * sp;
+  float b = bf16f(ABb[i]);
+  float beta = 1.0f / (1.0f + expf(-b));
+  Gout[i] = G;
+  Bout[i] = beta;
+}
+
 // ---------------- MLP act ----------------
 // engine-default W4A4: activations quantized before the q4c GEMMs (k_actq).
 // Emulate: symmetric int4 grid, per-row bf16 scale, RNE round, then dequant to bf16.
@@ -409,6 +436,185 @@ __global__ void k_silu_mul(const uint16_t* __restrict__ G, const uint16_t* __res
   float sg = g / (1.0f + expf(-g));
   uint16_t gb = f32bf(sg);
   Hh[i] = f32bf(bf16f(gb) * bf16f(U[i]));
+}
+
+// ---------------- i4l (Hadamard-rotated int4) ----------------
+// Weights stored as: N rows x K/2 bytes of 4-bit two's-complement codes
+// (lo nib = even col), then N x (K/256) fp16 scales. Dequant gives W'
+// (the rotated weights); W[n, 256c:(c+1)256] = W'[same] @ Hadamard256/16.
+// Acts are rotated by the same H before quantization (k_actq_had), so
+// fp16 GEMM on (a', W') equals the engine's int4 W4A4 products exactly.
+__device__ inline float fp16f(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t man = h & 0x3FFu;
+  if (exp == 0) { float d = (float)man * (1.0f / 16777216.0f); return sign ? -d : d; }
+  if (exp == 31) return man ? nanf("1") : (sign ? -INFINITY : INFINITY);
+  uint32_t u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+  return __uint_as_float(u);
+}
+
+__global__ void k_dequant_i4l(const uint8_t* __restrict__ pay,
+                              const uint16_t* __restrict__ sc,
+                              uint16_t* __restrict__ out, int cols, long nr) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long n = nr * (long)cols;
+  if (i >= n) return;
+  int col = (int)(i % cols);
+  long row = i / cols;
+  uint8_t b = pay[row * (cols >> 1) + (col >> 1)];
+  int nib = (col & 1) ? (int)(b >> 4) : (int)(b & 0xF);
+  int code = (nib > 7) ? nib - 16 : nib;
+  float s = fp16f(sc[row * (cols >> 8) + (col >> 8)]);
+  out[i] = f32bf((float)code * s);
+}
+
+// in-place Hadamard-256 along cols, per (row, 256-chunk): X = X @ H/16
+__global__ void k_had_cols(uint16_t* __restrict__ X) {
+  __shared__ float sh[256];
+  int tid = threadIdx.x;
+  long base = (long)blockIdx.x * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  X[base + tid] = f32bf(sh[tid] * (1.0f / 16.0f));
+}
+
+// W4A4 exact act-quant emission (engine k_actq<true> semantics, verified
+// bit-exact against the original): H-rotate the row's 256-chunk, scale =
+// fp16(absmax/7), q = rint(v/scale) clamped [-7,7], emit packed codes (lo nib
+// = even col) + one fp16 scale per (row, 256-chunk). Input NOT modified.
+__device__ inline uint16_t f32h(float x) {
+  uint32_t u = __float_as_uint(x);
+  uint32_t sign = (u >> 16) & 0x8000u;
+  int32_t e = (int32_t)((u >> 23) & 0xFFu) - 127 + 15;
+  uint32_t m = u & 0x7FFFFFu;
+  if (((u >> 23) & 0xFFu) == 255) return (uint16_t)(sign | 0x7C00u | (m ? 0x200u : 0));
+  if (e >= 31) return (uint16_t)(sign | 0x7C00u);
+  if (e <= 0) {
+    if (e < -10) return (uint16_t)sign;
+    m |= 0x800000u;
+    int sh = 14 - e;
+    uint32_t r = m >> sh, rem = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
+    r += (rem > half || (rem == half && (r & 1))) ? 1u : 0u;
+    return (uint16_t)(sign | r);
+  }
+  uint32_t r = ((uint32_t)e << 10) | (m >> 13);
+  uint32_t rem = m & 0x1FFFu;
+  r += (rem > 0x1000u || (rem == 0x1000u && (r & 1))) ? 1u : 0u;
+  return (uint16_t)(sign | r);
+}
+
+__global__ void k_actq_emit(const uint16_t* __restrict__ X, uint8_t* __restrict__ C,
+                            uint16_t* __restrict__ S, long cols) {
+  __shared__ float sh[256], sm[256];
+  __shared__ uint8_t sc[256];
+  int tid = threadIdx.x;
+  long tok = blockIdx.x;
+  int chunk = blockIdx.y;
+  long base = tok * cols + (long)chunk * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  float v = sh[tid] * (1.0f / 16.0f);
+  sm[tid] = fabsf(v);
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) sm[tid] = fmaxf(sm[tid], sm[tid + off]);
+    __syncthreads();
+  }
+  uint16_t sb = f32h(sm[0] / 7.0f);
+  float scale = fp16f(sb);
+  if (tid == 0) S[tok * (cols >> 8) + chunk] = sb;
+  float q = 0.f;
+  if (scale > 0.f) {                    // engine: exec-masked when scale == 0
+    q = rintf(v / scale);
+    q = fminf(fmaxf(q, -7.f), 7.f);
+  }
+  sc[tid] = (uint8_t)((int)q & 0xF);
+  __syncthreads();
+  if (tid < 128) C[tok * (cols >> 1) + chunk * 128 + tid] =
+      (uint8_t)(sc[2 * tid] | (sc[2 * tid + 1] << 4));
+}
+
+// Engine k_gemm_i4 semantics (verified vs dumped outputs): per 256-chunk exact
+// int dot of the 4-bit codes, scaled by f32(act_scale * weight_scale), f32
+// accumulated over chunks in ascending order, one bf16 round at the end.
+__global__ void k_gemm_i4emul(const uint8_t* __restrict__ ac, const uint16_t* __restrict__ as,
+                              const uint8_t* __restrict__ wc, const uint16_t* __restrict__ ws,
+                              uint16_t* __restrict__ C, int N, long K) {
+  int m = blockIdx.x;
+  int n = blockIdx.y * blockDim.x + threadIdx.x;
+  if (n >= N) return;
+  long per = K >> 1;
+  int nsc = (int)(K >> 8);
+  const uint8_t* arow = ac + (size_t)m * per;
+  const uint8_t* wrow = wc + (size_t)n * per;
+  const uint16_t* asr = as + (size_t)m * nsc;
+  const uint16_t* wsr = ws + (size_t)n * nsc;
+  __shared__ uint8_t sab[128];
+  float acc = 0.f;
+  for (int c = 0; c < nsc; c++) {
+    if (threadIdx.x < 128) sab[threadIdx.x] = arow[c * 128 + threadIdx.x];
+    __syncthreads();
+    const uint8_t* wp = wrow + c * 128;
+    int dot = 0;
+    #pragma unroll 8
+    for (int j = 0; j < 128; j++) {
+      uint8_t ab = sab[j], wb = wp[j];
+      dot += ((ab & 15) - ((ab & 8) << 1)) * ((wb & 15) - ((wb & 8) << 1))
+           + ((ab >> 4) - ((ab & 0x80) >> 3)) * ((wb >> 4) - ((wb & 0x80) >> 3));
+    }
+    acc += (float)dot * (fp16f(asr[c]) * fp16f(wsr[c]));
+    __syncthreads();
+  }
+  C[(size_t)m * N + n] = f32bf(acc);
+}
+
+// W4A4 exact act-quant emulation: H-rotate the row's 256-chunk, quantize
+// with chunk scale absmax/7, rotate back. X ends as H(quant(H x)).
+__global__ void k_actq_had(uint16_t* __restrict__ X) {
+  __shared__ float sh[256], sm[256];
+  int tid = threadIdx.x;
+  long base = (long)blockIdx.x * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  float v = sh[tid] * (1.0f / 16.0f);
+  sm[tid] = fabsf(v);
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) sm[tid] = fmaxf(sm[tid], sm[tid + off]);
+    __syncthreads();
+  }
+  float scale = bf16f(f32bf(sm[0] / 7.0f));
+  if (scale <= 0.f) scale = 1.0f;
+  float q = rintf(v / scale);
+  q = fminf(fmaxf(q, -8.f), 7.f);
+  sh[tid] = q * scale;
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  X[base + tid] = f32bf(sh[tid] * (1.0f / 16.0f));
 }
 
 // ---------------- logits reduction ----------------
@@ -530,6 +736,29 @@ static void load_q4c(const char* name, long rows, long cols, uint16_t* d_out) {
     CK(hipDeviceSynchronize());
   }
 }
+// i4l -> device bf16 (unrotated W'), row-chunked:
+//   [N x K/2 code bytes][N x (K/256) fp16 scales]
+static void load_i4l(const char* name, long rows, long cols, uint16_t* d_out) {
+  const Ent* e = find(name);
+  long per = cols >> 1;
+  long nsc = cols >> 8;
+  long chunk = (long)(24e6 / per); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + r0 * per, h_stage, (size_t)nr * per);
+    up(d_raw, h_stage, (size_t)nr * per);
+    rd(e->off + rows * per + r0 * nsc * 2, h_stage2, (size_t)nr * nsc * 2);
+    up(d_raws, h_stage2, (size_t)nr * nsc * 2);
+    long n = nr * cols;
+    k_dequant_i4l<<<GRID1(n), 256>>>(d_raw, d_raws, d_out + r0 * cols, (int)cols, nr);
+    k_had_cols<<<(unsigned)(nr * (cols >> 8)), 256>>>(d_out + r0 * cols);
+    CK(hipDeviceSynchronize());
+  }
+}
+static const Ent* try_find(const char* name) {
+  for (auto& e : g_tbl) if (strcmp(e.name, name) == 0) return &e;
+  return nullptr;
+}
 static void load_bf16(const char* name, long bytes, void* d_out) {
   const Ent* e = find(name);
   long chunk = 32 << 20;
@@ -567,6 +796,15 @@ static bool pool_add(const char* name, long rows, long cols) {
   return true;
 }
 
+static int g_prefill = 0;  // 1 = multi-token forward: use Hadamard-rotated i4l weights
+
+static int gate_dt5(int l) {
+  char nm[176];
+  snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l);
+  const Ent* e = find(nm);
+  return e && e->dt == 5;
+}
+
 static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
   auto it = g_wmap.find(name);
   if (it != g_wmap.end()) {
@@ -580,6 +818,13 @@ static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
                                         (const uint16_t*)(d_wpool + w.off + (size_t)rows * cols),
                                         d_out, cols);
     return;
+  }
+  if (g_prefill && find(name)->dt == 5) {
+    // Only q4c-based tensors take the rotated-i4l W4A4 route (engine rule:
+    // base dt 5 -> i4l W4A4; base dt 6 (fp8r) -> dequant + bf16 GEMM).
+    char nm2[176];
+    snprintf(nm2, sizeof(nm2), "%s.i4l", name);
+    if (try_find(nm2)) { load_i4l(nm2, rows, cols, d_out); return; }
   }
   load_auto(name, rows, cols, d_out);
 }
@@ -599,7 +844,7 @@ static void gemm_dispatch(const uint16_t* A, const char* name, const uint16_t* f
   char nm_i4l[160];
   snprintf(nm_i4l, sizeof(nm_i4l), "%s.i4l", name);
   auto it = g_wmap.find(nm_i4l);
-  if (it != g_wmap.end() && it->second.dt == 8 && d_Aq_ws && d_As_ws && (size_t)M <= 4096) {
+  if (it != g_wmap.end() && it->second.dt == 8 && d_Aq_ws && d_As_ws && (size_t)M <= 8192) {
     const WEnt& w = it->second;
     const uint8_t* W_q = d_wpool + w.off;
     const uint16_t* W_s = reinterpret_cast<const uint16_t*>(d_wpool + w.off + (long)N * (K / 2));
@@ -609,7 +854,25 @@ static void gemm_dispatch(const uint16_t* A, const char* name, const uint16_t* f
   gemm(A, fallback_W, C, M, N, K);
 }
 
-
+// stream one i4l tensor's raw codes + fp16 scales to device staging buffers
+// (used by the exact W4A4 int-dot GEMM emulation; no dequant, no unrotation)
+static uint8_t* d_wc[3]; static uint16_t* d_ws[3];
+static void load_i4l_raw(const char* name, long rows, long cols, int slot) {
+  const Ent* e = find(name);
+  long per = cols >> 1;
+  long nsc = cols >> 8;
+  uint8_t* dc = d_wc[slot];
+  uint16_t* ds = d_ws[slot];
+  long chunk = (long)(24e6 / per); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + r0 * per, h_stage, (size_t)nr * per);
+    up(dc + r0 * per, h_stage, (size_t)nr * per);
+    rd(e->off + rows * per + r0 * nsc * 2, h_stage2, (size_t)nr * nsc * 2);
+    up((uint8_t*)(ds + r0 * nsc), h_stage2, (size_t)nr * nsc * 2);
+  }
+  CK(hipDeviceSynchronize());
+}
 // fused dequant GEMV (decode steps, M == 1): C[n] = sum_k A[k] * dequant(W[n][k]).
 // fp8r: per-thread 16-k strips, two f32 accumulators, xor-butterfly reduce, row
 // scale applied once at the end (mirrors k_gemv's structure); q4c: per-element
@@ -656,6 +919,62 @@ __global__ void k_gemv_dq(const uint16_t* __restrict__ A,
   if (tid == 0) C[n] = f32bf(sh[0]);
 }
 
+// tiled fp8r GEMM matching BLASLt accumulation (single per-element k-chain)
+template<int PAIR>
+__global__ void k_gemm_fp8r(const uint16_t* __restrict__ A, const uint8_t* __restrict__ Wc,
+                            const uint16_t* __restrict__ Ws, uint16_t* __restrict__ C,
+                            int M, int N, int K) {
+  __shared__ uint16_t sw[64][64];
+  __shared__ uint16_t sa[16][64];
+  int n0 = blockIdx.x * 64;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  float wscale = (n0 + (blockIdx.y ? 0 : 0)) >= 0 ? bf16f(Ws[n0 + tx + 0]) : 0.f; // placeholder
+  (void)wscale;
+  float acc[4];
+  for (int e = 0; e < 4; e++) acc[e] = 0.f;
+  int m = blockIdx.y * 16 + ty;
+  for (int k0 = 0; k0 < K; k0 += 64) {
+    for (int s = 0; s < 16; s++) {
+      int l = (ty * 16 + tx) + s * 256;
+      int r = l & 63, c = l >> 6;
+      long n = (long)n0 + r, k = (long)k0 + c;
+      if (n < N && k < K) {
+        float w = dequant_fp8_e4m3(Wc[(size_t)n * K + k]) * bf16f(Ws[n]);
+        sw[r][c] = f32bf(w);
+      } else sw[r][c] = 0;
+    }
+    __syncthreads();
+    for (int s = 0; s < 4; s++) {
+      int c = tx + s * 16;
+      long k = (long)k0 + c;
+      sa[ty][c] = (m < M && k < K) ? A[(long)m * K + k] : (uint16_t)0;
+    }
+    __syncthreads();
+    if (PAIR) {
+      for (int kk = 0; kk < 64; kk += 2) {
+        float a0 = bf16f(sa[ty][kk]), a1 = bf16f(sa[ty][kk + 1]);
+        acc[0] += (a0 * bf16f(sw[tx][kk]) + a1 * bf16f(sw[tx][kk + 1]));
+        acc[1] += (a0 * bf16f(sw[tx + 16][kk]) + a1 * bf16f(sw[tx + 16][kk + 1]));
+        acc[2] += (a0 * bf16f(sw[tx + 32][kk]) + a1 * bf16f(sw[tx + 32][kk + 1]));
+        acc[3] += (a0 * bf16f(sw[tx + 48][kk]) + a1 * bf16f(sw[tx + 48][kk + 1]));
+      }
+    } else {
+      for (int kk = 0; kk < 64; kk++) {
+        float av = bf16f(sa[ty][kk]);
+        acc[0] += av * bf16f(sw[tx][kk]);
+        acc[1] += av * bf16f(sw[tx + 16][kk]);
+        acc[2] += av * bf16f(sw[tx + 32][kk]);
+        acc[3] += av * bf16f(sw[tx + 48][kk]);
+      }
+    }
+    __syncthreads();
+  }
+  for (int e = 0; e < 4; e++) {
+    long n = (long)n0 + tx + e * 16;
+    if (n < N) C[(long)m * N + n] = f32bf(acc[e]);
+  }
+}
+
 // plain bf16 GEMV with f32 output (lm_head at T == 1)
 __global__ void k_gemv_bf16f(const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
                              float* __restrict__ C, int K) {
@@ -700,10 +1019,15 @@ static bool gemv_dq(const uint16_t* A, const char* name, uint16_t* C) {  if (!d_
 static uint16_t *d_embed, *d_lmhead;
 static uint16_t *d_ln_in_all, *d_ln_post_all, *d_final_norm;
 static uint16_t *d_gdn_conv, *d_gdn_a, *d_gdn_b, *d_gdn_norm;
+static float *d_alog, *d_dtbias, *d_gateG, *d_gateB;
+static int g_gemm_mode = 0;
+static int g_deq_trunc = 0;   // 0 = gemv_dq (split-k), 1 = tiled fp8r plain, 2 = tiled fp8r pairs
+static float *h_gateG_dev, *h_gateB_dev;   // host mirrors of device gates
 static uint16_t *d_qnorm, *d_knorm;
 static uint16_t *d_qkv, *d_z, *d_outp;
 static uint16_t *d_q, *d_k, *d_v, *d_o;
 static uint16_t *d_gate, *d_up, *d_down;
+static uint8_t* d_qc; static uint16_t* d_qs;
 static uint16_t *d_convstate;                 // [48][10240][3]
 static uint16_t *d_kcache, *d_vcache;         // [16][CXT][4][256]
 static uint16_t *d_x, *d_ln1, *d_ln2, *d_tmp1;
@@ -724,6 +1048,8 @@ static uint16_t* h_abbf;      // [TMAX][48]
 static float* h_af;           // [TMAX][48]
 static float* h_bf;           // [TMAX][48]
 static uint16_t* h_co;        // [TMAX][6144]
+static float* h_gateG;        // [TMAX][48] device-computed exact gates
+static float* h_gateB;
 static int* h_prompt; static int h_nprompt;
 static float h_qscale;
 
@@ -848,6 +1174,7 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
   const float* al = h_alog + (long)ord * HV;
   const float* dt = h_dtbias + (long)ord * HV;
   const int CS = 64;
+  (void)al; (void)dt; (void)af; (void)bfv;
   const int nch = (T + CS - 1) / CS;
   const int NP = nch * CS;
 #ifdef _OPENMP
@@ -874,9 +1201,8 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
         Q[(long)t * DK + i] = qv; K[(long)t * DK + i] = kv_;
       }
       for (int i = 0; i < DV; i++) V[(long)t * DV + i] = h_bf16f(vp[i]);
-      G[t] = -expf(al[hh]) * softplusf(af[(long)t * HV + hh] + dt[hh]);
-      B[t] = 1.0f / (1.0f + expf(-bfv[(long)t * HV + hh]));   // k_dn_gates emits f32 beta
-      if (!g_beta32) B[t] = h_bf16f(h_f32bf(B[t]));
+      G[t] = h_gateG_dev[(long)t * HV + hh];
+      B[t] = h_gateB_dev[(long)t * HV + hh];
     }
     std::vector<float> vb((long)NP * DV), kb((long)NP * DK);
     for (int t = 0; t < NP; t++) {
@@ -968,6 +1294,7 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
 // ---------------- forward ----------------
 // T tokens at positions pos_base..; logits [T][VOC] f32 in d_logits when want_logits
 static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
+  g_prefill = (T > 1);
   k_embed<<<GRID1((long)T * HID), 256>>>(d_tokens, d_embed, d_x, HID);
   CK(hipDeviceSynchronize());
   if (g_dbg) { printf("after embed:\n"); dbg_row("embed", d_x, 0, HID); }
@@ -976,6 +1303,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     int fa = (l % 4 == 3);
     int gi = fa ? fa_ord(l) : gdn_ord(l);
     bool fused = (T == 1 && d_wpool);   // decode step: fused dequant-GEMV, no dequanted W
+    int w4 = g_actq && T >= 64 && d_wc[0] && gate_dt5(l);
     // ---- load weights for this layer (or fused from the pool) ----
     if (fa) {
       if (!fused) {
@@ -987,32 +1315,74 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     } else {
       if (!fused) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); getw(nm, QKVW, HID, d_qkv);
+        { const char* dp = getenv("HALO_DUMP_WQ");
+          if (dp && l == 0) { CK(hipDeviceSynchronize()); void* hb = malloc((long)QKVW * HID * 2);
+            CK(hipMemcpy(hb, d_qkv, (long)QKVW * HID * 2, hipMemcpyDeviceToHost));
+            FILE* f = fopen(dp, "wb"); fwrite(hb, 1, (long)QKVW * HID * 2, f); fclose(f); free(hb); }
+          if (getenv("HALO_DEQ_DBG") && l == 0) {
+            uint16_t v; CK(hipMemcpy(&v, d_qkv + 5L * HID + 16, 2, hipMemcpyDeviceToHost));
+            printf("[ours qkv(5,16)] = %u (%f)\n", (unsigned)v, h_bf16f(v)); } }
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   getw(nm, HV * DV, HID, d_z);
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    getw(nm, HID, HV * DV, d_outp);
       }
     }
     if (!fused) {
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw(nm, INTM, HID, d_gate);
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
+      if (w4) {
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight.i4l", l);
+        load_i4l_raw(nm, INTM, HID, 0);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight.i4l", l);
+        load_i4l_raw(nm, INTM, HID, 1);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight.i4l", l);
+        load_i4l_raw(nm, HID, INTM, 2);
+      } else {
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw(nm, INTM, HID, d_gate);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
+      }
       CK(hipDeviceSynchronize());
     }
     double tload = now_s() - tw;
 
     // ---- input layernorm ----
+    dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_in_all + (long)l * HID, d_ln1, HID, T, 1);
     CK(hipDeviceSynchronize());
 
     double tc = now_s();
     if (!fa) {
       // ---- GDN branch ----
-      if (fused) {
+      { const char* qp = getenv("HALO_GEMM_MODE"); if (qp) g_gemm_mode = atoi(qp); }
+      { const char* qp = getenv("HALO_DEQ_TRUNC"); if (qp) g_deq_trunc = atoi(qp); }
+      { const char* qp = getenv("HALO_QKV_IN");
+        if (qp && l == 0 && T > 1) {
+          FILE* fp = fopen(qp, "rb");
+          if (fp) { void* hb = malloc((long)T * QKVW * 2);
+            size_t rn = fread(hb, 1, (long)T * QKVW * 2, fp); fclose(fp);
+            CK(hipMemcpy(d_qkvraw, hb, rn, hipMemcpyHostToDevice)); free(hb);
+            fprintf(stderr, "[qkv-in] replaced d_qkvraw with %zu bytes\n", rn); }
+        } else if (fused) {
+        if (g_gemm_mode) {
+          const WEnt* wq = &g_wmap.at((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm));
+          const WEnt* wz = &g_wmap.at((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm));
+          int Nq = (int)wq->rows, Nz = (int)wz->rows;
+          const uint16_t* wqs = (const uint16_t*)(d_wpool + wq->off + (size_t)wq->rows * wq->cols);
+          const uint16_t* wzs = (const uint16_t*)(d_wpool + wz->off + (size_t)wz->rows * wz->cols);
+          dim3 gq((unsigned)((Nq + 63) / 64), (unsigned)T), gz((unsigned)((Nz + 63) / 64), (unsigned)T);
+          if (g_gemm_mode == 1) {
+            k_gemm_fp8r<0><<<gq, dim3(16, 16)>>>(d_ln1, d_wpool + wq->off, wqs, d_qkvraw, T, Nq, (int)wq->cols);
+            k_gemm_fp8r<0><<<gz, dim3(16, 16)>>>(d_ln1, d_wpool + wz->off, wzs, d_zout, T, Nz, (int)wz->cols);
+          } else {
+            k_gemm_fp8r<1><<<gq, dim3(16, 16)>>>(d_ln1, d_wpool + wq->off, wqs, d_qkvraw, T, Nq, (int)wq->cols);
+            k_gemm_fp8r<1><<<gz, dim3(16, 16)>>>(d_ln1, d_wpool + wz->off, wzs, d_zout, T, Nz, (int)wz->cols);
+          }
+        } else {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); gemv_dq(d_ln1, nm, d_qkvraw);
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   gemv_dq(d_ln1, nm, d_zout);
+        }
       } else {
         gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm), d_qkv, d_qkvraw, T, QKVW, HID);
         gemm_dispatch(d_ln1, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm), d_z, d_zout, T, HV * DV, HID);
-      }
+      } }
       if (T > 1) {
         k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
         k_conv_setstate<<<QKVW / 256, 256>>>(d_qkvraw, d_convstate + (long)gi * QKVW * 3, T);
@@ -1023,12 +1393,33 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
       gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
       CK(hipDeviceSynchronize());
+      { const char* dp = getenv("HALO_DUMP_QKVRAW");
+        if (dp && l == 0) { void* hb = malloc((long)T * QKVW * 2);
+          CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvraw, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, (long)T * QKVW * 2, f); fclose(f); free(hb); } }
+      { const char* dp = getenv("HALO_DUMP_QKVC");
+        if (dp && l == 0) { void* hb = malloc(4096);
+          CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvc, 4096, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 4096, f); fclose(f); free(hb); } }
       CK(hipMemcpy(h_qkvbf, d_qkvc, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
       CK(hipMemcpy(h_abbf, d_ab_a, (long)T * HV * 2, hipMemcpyDeviceToHost));
       for (long i = 0; i < (long)T * HV; i++) h_af[i] = h_bf16f(h_abbf[i]);
       CK(hipMemcpy(h_abbf, d_ab_b, (long)T * HV * 2, hipMemcpyDeviceToHost));
       for (long i = 0; i < (long)T * HV; i++) h_bf[i] = h_bf16f(h_abbf[i]);
       double ts = now_s();
+      k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
+                                                d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(h_gateG_dev, d_gateG, (long)T * HV * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(h_gateB_dev, d_gateB, (long)T * HV * 4, hipMemcpyDeviceToHost));
+      { const char* dp = getenv("HALO_DUMP_GB");
+        if (dp && l == 0) { void* hb = malloc(4096 * 2);
+          CK(hipMemcpy(hb, d_gateG, 4096, hipMemcpyDeviceToHost));
+          CK(hipMemcpy((char*)hb + 4096, d_gateB, 4096, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 8192, f); fclose(f); free(hb); } }
+      { const char* dp = getenv("HALO_DUMP_AB");
+        if (dp && l == 0) { FILE* f = fopen(dp, "wb");
+          fwrite(h_af, 4, 1024, f); fwrite(h_bf, 4, 1024, f); fclose(f); } }
       gdn_scan(T, h_qkvbf, h_af, h_bf, gi, h_co);
       double tscan = now_s() - ts;
       if (g_dbg) {
@@ -1051,7 +1442,15 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
                1.f / (1.f + expf(-h_bf[0])));
       }
       up(d_co, h_co, (long)T * HV * DV * 2);
+      { const char* dp = getenv("HALO_DUMP_CO");
+        if (dp && l == 0) { void* hb = malloc(2048);
+          CK(hipMemcpy(hb, d_co, 2048, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 2048, f); fclose(f); free(hb); } }
       k_gdn_gatednorm<<<GRID1((long)T * HV), 256>>>(d_co, d_zout, d_gdn_norm + (long)gi * DV, d_gn, T);
+      { const char* gp = getenv("HALO_DUMP_GN");
+        if (gp && l == 0) { CK(hipDeviceSynchronize()); void* hb2 = malloc(2048);
+          CK(hipMemcpy(hb2, d_gn, 2048, hipMemcpyDeviceToHost));
+          FILE* f = fopen(gp, "wb"); fwrite(hb2, 1, 2048, f); fclose(f); free(hb2); } }
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); gemv_dq(d_gn, nm, d_tmp1);
       } else {
@@ -1096,10 +1495,27 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
 
     // ---- MLP ----
+    dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_post_all + (long)l * HID, d_ln2, HID, T, 1);
     if (g_dbg) dbg_all("ln2", d_ln2, T, HID);
-    if (g_actq & 2) k_actq<<<T, 256>>>(d_ln2, HID, 0);
-    if (fused) {
+    { const char* dp = getenv("HALO_DUMP_LN2");
+      if (dp && l == 0) { void* hb = malloc(TMAX * HID * 2);
+        CK(hipMemcpy(hb, d_ln2, 87L * HID * 2, hipMemcpyDeviceToHost));
+        FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 87L * HID * 2, f); fclose(f); free(hb); } }
+    if (w4) {
+      k_actq_emit<<<dim3(T, HID / 256), 256>>>(d_ln2, d_qc, d_qs, HID);
+      k_gemm_i4emul<<<dim3(T, INTM / 256), 256>>>(d_qc, d_qs, d_wc[0], d_ws[0], d_g17, INTM, HID);
+      k_gemm_i4emul<<<dim3(T, INTM / 256), 256>>>(d_qc, d_qs, d_wc[1], d_ws[1], d_u17, INTM, HID);
+      { const char* dp = getenv("HALO_DUMP_W4");
+        if (dp && l == 0) { CK(hipDeviceSynchronize());
+          void* hb = malloc(34816 * 2); void* hb2 = malloc(4096);
+          CK(hipMemcpy(hb, d_g17, 34816 * 2, hipMemcpyDeviceToHost));
+          CK(hipMemcpy(hb2, d_qc, 4096, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 34816 * 2, f);
+          fwrite(hb2, 1, 4096, f); fclose(f); free(hb); free(hb2);
+          CK(hipMemcpy(hb2, d_qs, 4096, hipMemcpyDeviceToHost));
+          f = fopen("/tmp/ours_qs.bin", "wb"); fwrite(hb2, 1, 4096, f); fclose(f); free(hb2); } }
+    } else if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq(d_ln2, nm, d_g17);
       snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq(d_ln2, nm, d_u17);
     } else {
@@ -1108,8 +1524,10 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     }
     if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
     k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
-    if (g_actq & 1) k_actq<<<T, 256>>>(d_act, INTM, 0);
-    if (fused) {
+    if (w4) {
+      k_actq_emit<<<dim3(T, INTM / 256), 256>>>(d_act, d_qc, d_qs, INTM);
+      k_gemm_i4emul<<<dim3(T, HID / 256), 256>>>(d_qc, d_qs, d_wc[2], d_ws[2], d_tmp1, HID, INTM);
+    } else if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq(d_act, nm, d_tmp1);
     } else {
       gemm_dispatch(d_act, (snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm), d_down, d_tmp1, T, HID, INTM);
@@ -1121,6 +1539,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     if (getenv("HALO_TIME")) printf("  L%d load %.2fs compute %.2fs\n", l, tload, now_s() - tc);
   }
   if (want_logits) {
+    dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_final_norm, d_ln1, HID, T, 1);
     if (T == 1 && d_wpool) k_gemv_bf16f<<<VOC, 256>>>(d_ln1, d_lmhead, d_logits, HID);
     else gemm_f32(d_ln1, d_lmhead, d_logits, T, VOC, HID);
@@ -1196,6 +1615,12 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_gdn_norm, (long)48 * DV * 2));
   h_alog = (float*)malloc((long)48 * HV * 4);
   h_dtbias = (float*)malloc((long)48 * HV * 4);
+  h_gateG_dev = (float*)malloc((long)TMAX * HV * 4);
+  h_gateB_dev = (float*)malloc((long)TMAX * HV * 4);
+  CK(hipMalloc((void**)&d_alog, (long)48 * HV * 4));
+  CK(hipMalloc((void**)&d_dtbias, (long)48 * HV * 4));
+  CK(hipMalloc((void**)&d_gateG, (long)TMAX * HV * 4));
+  CK(hipMalloc((void**)&d_gateB, (long)TMAX * HV * 4));
   { int gi = 0;
     for (int l = 0; l < NL; l++) {
       if (l % 4 == 3) continue;
@@ -1215,6 +1640,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
       rd(e->off, h_stage2, 96);
       { uint16_t* u = (uint16_t*)h_stage2;
         for (int i = 0; i < HV; i++) h_dtbias[(long)gi * HV + i] = h_bf16f(u[i]); }
+      CK(hipMemcpy(d_alog + (long)gi * HV, h_alog + (long)gi * HV, HV * 4, hipMemcpyHostToDevice));
+      CK(hipMemcpy(d_dtbias + (long)gi * HV, h_dtbias + (long)gi * HV, HV * 4, hipMemcpyHostToDevice));
       gi++;
     } }
   CK(hipMalloc((void**)&d_qnorm, (long)16 * HD * 2));
@@ -1238,6 +1665,12 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_gate, (long)INTM * HID * 2));
   CK(hipMalloc((void**)&d_up, (long)INTM * HID * 2));
   CK(hipMalloc((void**)&d_down, (long)HID * INTM * 2));
+  for (int i = 0; i < 3; i++) {
+    CK(hipMalloc((void**)&d_wc[i], (long)INTM * HID / 2 + 1024));
+    CK(hipMalloc((void**)&d_ws[i], (long)INTM * HID / 256 * 2 + 1024));
+  }
+  CK(hipMalloc((void**)&d_qc, (long)TMAX * INTM / 2 + 1024));
+  CK(hipMalloc((void**)&d_qs, (long)TMAX * (INTM / 256) * 2 + 1024));
 
   CK(hipMalloc((void**)&d_convstate, (long)48 * QKVW * 3 * 2));
   CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));

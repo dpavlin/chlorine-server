@@ -75,12 +75,137 @@ Layout: `[64-byte codebook][row 0: payload+scales][row 1: payload+scales]…`
   gemm0.asm, or a differential probe. Probes: /tmp/opencode/i4l_*.py.
 - qparam `0x10100` on every i4l tensor: exact field semantics `[OPEN]`.
 
+## WMMA iu4 fragment maps (empirical, 2026-09-09 probe)
+
+Derived with a raw-LLVM-IR probe kernel (`@llvm.amdgcn.wmma.i32.16x16x16.iu4`
+exists; compile `.ll` → `.o` with
+`clang -target amdgcn-amd-amdhsa -mcpu=gfx1151 -c`, then **`ld.lld -shared`**
+— hipModuleLoad requires a linked shared object, a bare relocatable fails with
+hipErrorNoKernelImageForDevice). Probes: /tmp/opencode/wmprobe3.ll,
+wmhost.cpp, wmscan.cpp, amap.cpp, joint.cpp + the *.bin dumps.
+
+- **D** (16×16 i32): cell (t′, i) = (m = i + 8·(t′≥16), n = t′&15); threads
+  16-31 idle in W32. (Confirmed by both A and B one-hot sweeps — the earlier
+  (m = t′&15, n = i+…) reading was wrong.)
+- **Shared k-encoding (confirmed by value-multiplication test, 2026-09-09
+  wmprobe6/wmhost8 sweep)**: operand position (thread T, vgpr V, nibble N)
+  ↔ k = 8·V + N for BOTH A and B; the 4-bit nibble = the element VALUE
+  (wmma reads nibble values, not bits). Setting bit J of a vgpr sets
+  nibble (J>>2) to value 2^(J&3); two operands multiply (D-cell val =
+  A-val × B-val) exactly when their (vgpr, nibble) positions match.
+- **A**: element (m, k) → thread T = m&15, vgpr k>>3, nibble k&7 — the
+  thread's 2 vgprs = one row's 16 k's ascending. Threads 16-31 idle.
+- **B**: element (k, n) → thread T = n&15, vgpr k>>3, nibble k&7 — the
+  thread's ENTIRE operand (2 vgprs = 16 k's) = the n-column's 16
+  consecutive k's (k = 16h..16h+15 for the h-th wmma k-step). Threads
+  16-31 idle. (Thread 0 = the n=0 column, confirmed over all (V, N).)
+
+**Consequence for i4l (REVISED 2026-09-09, later probe)**: the B operand is
+ONE weight row's 16 consecutive k's — so the staged/global record (16 B) is
+one n-row's k's [16h, +16) in ascending order and **the device weights are
+[N, K]-major natural** (row stride K/2 = 8704 ✓ s31). The engine reads the
+i4l bytes RAW (the host loader copies them; the per-row 4-B is de-skipped).
+The [K, N]-major and n-pair/k-half hypotheses are dead.
+
+**The failed round(W/s) tests are explained: the quantization is
+codebook/compensated, not linear.** Evidence:
+- magnitude multiset of file codes ≈ clip(round(W/s_file), ±7) but the
+  per-position pairing fails everywhere (sign-match 0.41 = random for
+  every row/k/row-permutation/k-shift/layout variant tested);
+- the scales decode as fp16 with a FIXED exponent 2^-8 (odd bytes
+  constant 0x1D) — i.e. 8-bit mantissa × 2^-8, values ≈ absmax/5.3-7.0
+  (looser than absmax/7 → outlier clipping);
+- file layout = 5120 rows × (4 B + 8704 B) + 5120 × 136 B tail; sizes
+  exact (45,260,800 = 5120·8708 + 5120·136);
+- the per-row 4-B decodes as 2 fp16 fixed-exp values ≈ scales × 1.11
+  (e.g. 0.00559, 0.00580) — same format as the scale block;
+- cross-row constraint solving (k must satisfy code[p] = round(W[n,k]/s)
+  for ALL n) yields ZERO candidates → the codes are per-row-compensated
+  (GPTQ-style) or LUT-mapped, NOT round(W/s).
+
+**Load-time dequant kernels (k_dequant<0/1/2> in obj5.so)** decode SOME
+weight dtypes to bf16 at load (the u16-typed weights in k_gemv = PKt):
+- `<2>`: payload = raw bytes → 256-entry e4m3 decode LUT built in LDS
+  (sign = tid<0x80, exp = (tid>>3)&15, man = tid&7, RNE→bf16), then
+  out = LUT[code] × fp16 scale (global_load_d16_b16), RNE→bf16 stores.
+  = the fp8r loader.
+- `<1>`: same shape but the 256-entry table is LOADED from arg0 (an
+  explicit in-file/in-model codebook, fp16 entries converted to bf16) —
+  byte codes + explicit codebook + fp16 scales.
+- `<0>` (732 B): unexamined; likely the 4-bit variant.
+- The forward dispatch switches on a global quant-mode (`DAT_005c4480`,
+  trailing-zero count): cases 2-8 = dequant-then-gemm variants, default =
+  the gemv path. 8 quant modes total.
+- Launchers: FUN_0056b310→k_dequant<0>, FUN_0056b3c0→<1>,
+  FUN_0056b490→<2> (grid ((n+3)/4, 40) — 40 = N/128 row-tiles).
+
+**Next step**: read k_dequant<0>'s 732 B — if it indexes a 16-entry LUT
+(arg0) that is one of the file sections, the i4l = LUT-int4 and the
+codebook location + the exact scale addressing fall out of its addressing
+math directly.
+
+**Additional layout probes (2026-09-09, late)**: stride-8712 variant
+(8704 payload + 8 B in-row + 128-B/row tail block of 64 fp16 all-positive
+≈-scales) — the in-row 8 B is NOT fp16 scales (junk: 670, -9744, …);
+tail-64-fp16 sign-match also 0.41, and absmax/7-vs-scale ratios scatter
+0.78-1.31 — **the scales are for PERMUTED k-chunks: the file k-order =
+GPTQ act-order (data-dependent permutation), NOT the HF natural order.**
+The engine is self-consistent (its acts, actq, and gemm all use the file
+order), which is why it validates.
+
+**Recovery plan for the permutation P**: superseded — SOLVED 2026-09-09
+(late session). The "permutation" is not an act-order permutation at all:
+
+## I4L SOLVED: Hadamard-rotated int4 (QuaRot-style)
+
+The i4l tensor is the SAME weights quantized after an orthogonal 256-block
+Hadamard rotation. Element-wise it is uncorrelated with W (corr ≈ 0.001
+vs W, ≈ 0.002 vs q4c codes) but per-row energy is preserved to the
+quantization error (ratio 1.015-1.019), and blockwise reconstruction with
+the normalized Hadamard-256 gives corr(W_rec, W) = 0.9920-0.9924 across
+rows. Engine correctness follows: acts are rotated by the same H (the
+k_actq butterfly IS the fast Hadamard transform), so W'·a' = W·a exactly.
+
+**File layout (i4l, universal — verified on down_proj AND gate_proj)**:
+- [N rows × K/2 bytes of 4-bit two's-complement codes (lo nib = even k')]
+  ++ [separate scale block at the end: N × (K/256) fp16 LE]. Tensor size
+  = N·K/2 + N·(K/256)·2 exactly (45,260,800 for BOTH [5120,17408] =
+  5120·8704 + 5120·136 and [17408,5120] = 17408·2560 + 17408·40).
+  (An earlier note claimed per-row interleaved scales — wrong; the block
+  is contiguous after all payload rows.)
+- scales = one fp16 per (n, 256-k' chunk): 8-bit mantissa × tensor-shared
+  fixed exponent (2^-8 for layer 0 down/gate; bytes = [b, 0x1D] LE, fp16
+  value = (1 + (256+b)/1024)·2^-8); scale = absmax(rotated chunk)/7
+  EXACTLY (absmax/s = 7.000 at p1/p50/p99 on both tensors).
+- dequant: W'[n,k'] = code[n,k'] · s[n][k'>>8]
+- reconstruction: W[n, 256c:(c+1)·256] = W'[n, same] @ Hadamard256/16
+- verified on down_proj (corr 0.9920-0.9924), gate_proj (0.9922-0.9931),
+  and linear_attn.in_proj_qkv (0.9917-0.9927); absmax/s = 7.000 exact on
+  all three — the layout is universal for every i4l tensor.
+
+**Shadow tensors**: every i4l tensor has a same-dims q4c (dt=5) twin
+(e.g. layers.0.mlp.down_proj.weight dt=5 + .weight.i4l dt=8). q4c =
+UNROTATED linear int4 (corr 0.987, decode/gemv path); i4l = rotated copy
+(W4A4/prefill gemm path). Both loaded → the ~18 GB weight pool.
+
+**Hadamard details**: H256 = the standard unnormalized Hadamard (Sylvester)
+divided by 16; H symmetric so left/right multiply agree. corr peaks at
+shift 0 (shift-1 corr = 0.001), absmax/s = 7.000 post-hoc confirms both
+the chunking and the scale semantics. Residual 0.992 (not 1.0) = the
+4-bit quantization error only (q4c shows the same 0.987).
+
+**Probes**: /tmp/opencode/i4l_{kn,npair,permsweep,final*,split*,score,
+tileperm,rot,had,verify,entry,names}.py; kmap2.txt (full WMMA B-map sweep);
+q4c_dump.py; the dequant/gemv kernel decodes (obj5.so via
+/var/cache/lemonade/.../llvm-objdump).
+
 ## Validation summary
 
 - fp8r: reproduced base-model row0 exactly (std 0.01735 / absmax 0.06885);
   absmax→448 scaling exact.
 - q4c: corr 0.987–0.988 vs base model rows 0–39 (int4 quantization error
   only); e4m3 scale bytes match LSQ-implied scales.
-- i4l: layout open (see above).
+- i4l: SOLVED — Hadamard-rotated int4, reconstruction corr 0.9920-0.9924
+  (rows 0-7, down_proj), scale = absmax(rot-chunk)/7 exact, layout above.
 - Base reference: `Qwen/Qwen3.8-27B` shard 1 on evileye at
   `~/Projects/models/qwen-base/`.
