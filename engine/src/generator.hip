@@ -1553,7 +1553,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         gemm_dispatch(d_gn, (snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm), d_outp, d_tmp1, T, HID, HV * DV);
       }
       if (g_dbg) { dbg_all("zout", d_zout, T, HV * DV); dbg_all("gn", d_gn, T, HV * DV); dbg_all("gdn_attnout", d_tmp1, T, HID); }
-      if (getenv("HALO_TIME")) printf("  L%d gdn load %.2fs scan %.3fs\n", l, tload, tscan);
+      if (getenv("HALO_TIME")) printf("  L%d gdn load %.2fms scan %.2fms\n", l, tload * 1000.0, tscan * 1000.0);
     } else {
       // ---- FA branch ----
       if (fused) {
@@ -1626,7 +1626,15 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
     CK(hipDeviceSynchronize());
     if (g_dbg) { printf("after L%d (%s):\n", l, fa ? "fa" : "gdn"); dbg_all("x", d_x, T, HID); }
-    if (getenv("HALO_TIME")) printf("  L%d load %.2fs compute %.2fs\n", l, tload, now_s() - tc);
+    if (getenv("HALO_TIME")) {
+      double t_compute_ms = (now_s() - tc) * 1000.0;
+      double t_load_ms = tload * 1000.0;
+      if (t_compute_ms >= 1000.0) {
+        printf("  L%d (%s, T=%d) load %.2fms compute %.3fs\n", l, fa ? "fa" : "gdn", T, t_load_ms, t_compute_ms / 1000.0);
+      } else {
+        printf("  L%d (%s, T=%d) load %.2fms compute %.2fms\n", l, fa ? "fa" : "gdn", T, t_load_ms, t_compute_ms);
+      }
+    }
   }
   if (want_logits) {
     dumpx(d_x);
@@ -1919,10 +1927,21 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
   for (int p0 = 0; p0 < n_prompt; p0 += CHUNK_SIZE) {
     int chunk_T = std::min(CHUNK_SIZE, n_prompt - p0);
     int want_logits = (p0 + chunk_T == n_prompt) ? 1 : 0;
+    double tc0 = now_s();
     forward(d_tok + p0, chunk_T, p0, want_logits);
     if (want_logits) last_chunk_T = chunk_T;
+    double t_chunk = now_s() - tc0;
+    double chunk_tps = t_chunk > 0 ? ((double)chunk_T / t_chunk) : 0.0;
+    if (n_prompt > CHUNK_SIZE || getenv("HALO_TIME")) {
+      fprintf(stderr, "trunk: prefill chunk [%d..%d/%d] %d tokens in %.3fs (%.1f tok/s)\n",
+              p0, p0 + chunk_T - 1, n_prompt, chunk_T, t_chunk, chunk_tps);
+    }
   }
   *prefill_ms = (now_s() - tp) * 1000.0;
+  double prefill_s = *prefill_ms / 1000.0;
+  double prefill_tps = prefill_s > 0 ? ((double)n_prompt / prefill_s) : 0.0;
+  fprintf(stderr, "trunk: prefill complete: %d tokens in %.3fs (%.1f tok/s)\n",
+          n_prompt, prefill_s, prefill_tps);
 
   double td = now_s();
   int n_gen = 0, tok = 0, stop = 0;
@@ -1943,6 +1962,11 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
   }
   *decode_ms = (now_s() - td) * 1000.0;
   *stop_hit = stop;
+  double decode_s = *decode_ms / 1000.0;
+  double decode_tps = decode_s > 0 ? ((double)n_gen / decode_s) : 0.0;
+  double itl_ms = n_gen > 0 ? (*decode_ms / (double)n_gen) : 0.0;
+  fprintf(stderr, "trunk: decode complete: %d tokens in %.3fs (%.2f tok/s, %.1f ms/tok)\n",
+          n_gen, decode_s, decode_tps, itl_ms);
   return n_gen;
 }
 
@@ -2116,10 +2140,21 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
   for (int p0 = 0; p0 < n_prompt; p0 += CHUNK_SIZE) {
     int chunk_T = std::min(CHUNK_SIZE, n_prompt - p0);
     int want_logits = (p0 + chunk_T == n_prompt) ? 1 : 0;
+    double tc0 = now_s();
     forward(d_tok + p0, chunk_T, p0, want_logits);
     if (want_logits) last_chunk_T = chunk_T;
+    double t_chunk = now_s() - tc0;
+    double chunk_tps = t_chunk > 0 ? ((double)chunk_T / t_chunk) : 0.0;
+    if (n_prompt > CHUNK_SIZE || getenv("HALO_TIME")) {
+      fprintf(stderr, "trunk: prefill chunk [%d..%d/%d] %d tokens in %.3fs (%.1f tok/s)\n",
+              p0, p0 + chunk_T - 1, n_prompt, chunk_T, t_chunk, chunk_tps);
+    }
   }
   *prefill_ms = (now_s() - tp) * 1000.0;
+  double prefill_s = *prefill_ms / 1000.0;
+  double prefill_tps = prefill_s > 0 ? ((double)n_prompt / prefill_s) : 0.0;
+  fprintf(stderr, "trunk: prefill complete: %d tokens in %.3fs (%.1f tok/s)\n",
+          n_prompt, prefill_s, prefill_tps);
 
   double td = now_s();
   int n_gen = 0, tok = 0, stop = 0;
@@ -2153,6 +2188,11 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
   }
   *decode_ms = (now_s() - td) * 1000.0;
   *stop_hit = stop;
+  double decode_s = *decode_ms / 1000.0;
+  double decode_tps = decode_s > 0 ? ((double)n_gen / decode_s) : 0.0;
+  double itl_ms = n_gen > 0 ? (*decode_ms / (double)n_gen) : 0.0;
+  fprintf(stderr, "trunk: decode complete: %d tokens in %.3fs (%.2f tok/s, %.1f ms/tok)\n",
+          n_gen, decode_s, decode_tps, itl_ms);
   return n_gen;
 }
 

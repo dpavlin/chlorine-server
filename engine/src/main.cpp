@@ -103,6 +103,13 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
   char buf[160];
   snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f 0 0 0\n", id,
            stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms);
+  double prefill_s = prefill_ms / 1000.0;
+  double decode_s = decode_ms / 1000.0;
+  double prefill_tps = prefill_s > 0 ? ((double)prompt.size() / prefill_s) : 0.0;
+  double decode_tps = decode_s > 0 ? ((double)n_gen / decode_s) : 0.0;
+  double itl_ms = n_gen > 0 ? (decode_ms / (double)n_gen) : 0.0;
+  fprintf(stderr, "serve: [REQ %ld] prompt=%zu comp=%d | prefill: %.2fs (%.1f tok/s) | decode: %.2fs (%.2f tok/s, %.1f ms/tok) | %s\n",
+          id, prompt.size(), n_gen, prefill_s, prefill_tps, decode_s, decode_tps, itl_ms, stop_hit ? "stop" : "length");
   size_t off = 0;
   size_t len = strlen(buf);
   while (off < len) {
