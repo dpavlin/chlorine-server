@@ -42,7 +42,7 @@ static const float SCALE = 0.0625f;   // 1/sqrt(256)
 static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
 static const int   CXT   = 8192;      // kv cache capacity (8K context)
-static const int   TMAX  = 512;       // max chunk activation rows (>= 128 prefill chunk)
+static const int   TMAX  = 2048;      // max chunk activation rows (matches upstream Halogen 2K prefill)
 static const char* CKPT  = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
 
 static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved (2p, 2p+1)
@@ -955,6 +955,11 @@ static bool has_i4l_weight(const char* name) {
   return (it != g_wmap.end() && it->second.dt == 8);
 }
 
+static bool need_fallback_w(const char* name) {
+  if (getenv("HALO_NO_WMMA_I4")) return true;
+  return !has_i4l_weight(name);
+}
+
 static void gemm_dispatch(const uint16_t* A, const char* name, const uint16_t* fallback_W,
                           uint16_t* C, int M, int N, int K) {
   char nm_i4l[160];
@@ -1429,14 +1434,14 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     // ---- load weights for this layer (or fused from the pool) ----
     if (fa) {
       if (!fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  getw(nm, QH * HD * 2, HID, d_q);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  getw(nm, KVH * HD, HID, d_k);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  getw(nm, KVH * HD, HID, d_v);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l);  getw(nm, HID, QH * HD, d_o);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  if (need_fallback_w(nm)) getw(nm, QH * HD * 2, HID, d_q);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  if (need_fallback_w(nm)) getw(nm, KVH * HD, HID, d_k);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  if (need_fallback_w(nm)) getw(nm, KVH * HD, HID, d_v);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l);  if (need_fallback_w(nm)) getw(nm, HID, QH * HD, d_o);
       }
     } else {
       if (!fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); getw(nm, QKVW, HID, d_qkv);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); if (need_fallback_w(nm)) getw(nm, QKVW, HID, d_qkv);
         { const char* dp = getenv("HALO_DUMP_WQ");
           if (dp && l == 0) { CK(hipDeviceSynchronize()); void* hb = malloc((long)QKVW * HID * 2);
             CK(hipMemcpy(hb, d_qkv, (long)QKVW * HID * 2, hipMemcpyDeviceToHost));
@@ -1444,8 +1449,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
           if (getenv("HALO_DEQ_DBG") && l == 0) {
             uint16_t v; CK(hipMemcpy(&v, d_qkv + 5L * HID + 16, 2, hipMemcpyDeviceToHost));
             printf("[ours qkv(5,16)] = %u (%f)\n", (unsigned)v, h_bf16f(v)); } }
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   getw(nm, HV * DV, HID, d_z);
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    getw(nm, HID, HV * DV, d_outp);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   if (need_fallback_w(nm)) getw(nm, HV * DV, HID, d_z);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    if (need_fallback_w(nm)) getw(nm, HID, HV * DV, d_outp);
       }
     }
     if (!fused) {
@@ -1457,9 +1462,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight.i4l", l);
         load_i4l_raw(nm, HID, INTM, 2);
       } else {
-        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw(nm, INTM, HID, d_gate);
-        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
-        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); if (need_fallback_w(nm)) getw(nm, INTM, HID, d_gate);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   if (need_fallback_w(nm)) getw(nm, INTM, HID, d_up);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); if (need_fallback_w(nm)) getw(nm, HID, INTM, d_down);
       }
       CK(hipDeviceSynchronize());
     }
@@ -1810,7 +1815,7 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   // dequants from device memory per use (fallback: per-use file streaming)
   // Allocate activation workspace for hardware INT4 WMMA GEMM
   if (!d_Aq_ws) {
-    size_t max_T = 4096;
+    size_t max_T = 8192;
     size_t max_K = 17408;
     CK(hipMalloc(&d_Aq_ws, max_T * (max_K / 2)));
     CK(hipMalloc(&d_As_ws, max_T * (max_K / 256) * 2));
@@ -1904,7 +1909,12 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
   trunk_reset_states();
   double tp = now_s();
   up(d_tok, prompt, (size_t)n_prompt * 4);
-  const int CHUNK_SIZE = 128;
+  int chunk_sz = 2048;
+  if (getenv("HALO_CHUNK_SIZE")) {
+    int v = atoi(getenv("HALO_CHUNK_SIZE"));
+    if (v > 0) chunk_sz = std::min(TMAX, v);
+  }
+  const int CHUNK_SIZE = chunk_sz;
   int last_chunk_T = 0;
   for (int p0 = 0; p0 < n_prompt; p0 += CHUNK_SIZE) {
     int chunk_T = std::min(CHUNK_SIZE, n_prompt - p0);
@@ -2096,7 +2106,12 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
   trunk_reset_states();
   double tp = now_s();
   up(d_tok, prompt, (size_t)n_prompt * 4);
-  const int CHUNK_SIZE = 128;
+  int chunk_sz = 2048;
+  if (getenv("HALO_CHUNK_SIZE")) {
+    int v = atoi(getenv("HALO_CHUNK_SIZE"));
+    if (v > 0) chunk_sz = std::min(TMAX, v);
+  }
+  const int CHUNK_SIZE = chunk_sz;
   int last_chunk_T = 0;
   for (int p0 = 0; p0 < n_prompt; p0 += CHUNK_SIZE) {
     int chunk_T = std::min(CHUNK_SIZE, n_prompt - p0);
